@@ -7,7 +7,7 @@ closes it.
 Artifacts live at `.pi/workers/<slug>/runs/run-NNNNNN/`:
 
 - `brief.md`: exact opening prompt, mode `0600`;
-- `result.json`: atomically published terminal record.
+- `result.json`: atomically published terminal record, mode `0600`.
 
 Schema `pi-delegate.result.v1` records status, timing, abort origin, worker
 health, session identity, requested and actual model, usage, stop reason, final

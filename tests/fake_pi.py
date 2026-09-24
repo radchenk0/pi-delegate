@@ -24,6 +24,18 @@ for raw in sys.stdin.buffer:
     request_id = command.get("id")
     kind = command.get("type")
     message = command.get("message", "")
+    if kind == "get_state":
+        emit({
+            "type": "response",
+            "id": request_id,
+            "command": "get_state",
+            "success": True,
+            "data": {
+                "sessionId": "fake-session",
+                "model": {"provider": "fake-provider", "id": "fake-model"},
+            },
+        })
+        continue
     if kind in {"prompt", "follow_up", "steer", "abort"}:
         if "REJECT" in message:
             emit({"type": "response", "id": request_id, "success": False, "error": "fake rejection"})

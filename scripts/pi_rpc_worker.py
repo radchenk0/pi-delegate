@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import selectors
 import shutil
 import signal
@@ -22,6 +23,7 @@ import uuid
 
 
 SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+RUN_ID_RE = re.compile(r"^run-[0-9]{6}$")
 STATE_FLUSH_INTERVAL = 0.5
 PROCESS_GRACE_SECONDS = 2.0
 RESULT_SCHEMA = "pi-delegate.result.v1"
@@ -66,14 +68,14 @@ def load_state(path: Path) -> dict:
 def save_state(path: Path, state: dict) -> None:
     state["updatedAt"] = time.time()
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_private_text(temp, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
     os.replace(temp, path)
 
 
 def atomic_write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_private_text(temp, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
     os.replace(temp, path)
 
 
@@ -245,7 +247,9 @@ def effective_state(p: dict[str, Path], persist: bool = True) -> dict:
 
 def acquire_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(lock_path.parent, 0o700)
     handle = lock_path.open("a+", encoding="utf-8")
+    os.fchmod(handle.fileno(), 0o600)
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -340,6 +344,11 @@ def finalize_run(
     run = state.get("openRun")
     if not isinstance(run, dict):
         return None
+    run_id = run.get("runId")
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        state["lastError"] = "refusing unsafe run identifier in state"
+        state["openRun"] = None
+        return None
     after = git_snapshot(p["cwd"])
     before = run.get("gitBefore")
     before_paths = set((before or {}).get("paths", []))
@@ -350,7 +359,7 @@ def finalize_run(
     result = {
         "schema": RESULT_SCHEMA,
         "slug": state.get("slug"),
-        "runId": run["runId"],
+        "runId": run_id,
         "status": status,
         "abortOrigin": abort_origin,
         "workerAlive": worker_alive,
@@ -360,8 +369,8 @@ def finalize_run(
         "sessionFile": state.get("sessionFile"),
         "sessionId": state.get("sessionId"),
         "requestedModel": state.get("requestedModel"),
-        "actualProvider": run.get("actualProvider"),
-        "actualModel": run.get("actualModel"),
+        "actualProvider": run.get("actualProvider") or state.get("actualProvider"),
+        "actualModel": run.get("actualModel") or state.get("actualModel"),
         "usage": run.get("usage") or None,
         "stopReason": run.get("stopReason"),
         "finalMessage": run.get("finalMessage") or "",
@@ -387,9 +396,9 @@ def finalize_run(
         "signal": signal_name,
         "error": error,
     }
-    result_path = p["runs"] / run["runId"] / "result.json"
+    result_path = p["runs"] / run_id / "result.json"
     atomic_write_json(result_path, result)
-    state["lastRunId"] = run["runId"]
+    state["lastRunId"] = run_id
     state["lastRunStatus"] = status
     state["lastResultPath"] = str(result_path)
     state["lastError"] = error
@@ -462,6 +471,13 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
         data = event.get("data")
         if isinstance(data, dict):
             state["sessionId"] = data.get("sessionId") or state.get("sessionId")
+            model = data.get("model")
+            if isinstance(model, dict):
+                state["actualProvider"] = model.get("provider") or state.get("actualProvider")
+                state["actualModel"] = model.get("id") or model.get("model") or state.get("actualModel")
+                if isinstance(run, dict):
+                    run["actualProvider"] = state.get("actualProvider") or run.get("actualProvider")
+                    run["actualModel"] = state.get("actualModel") or run.get("actualModel")
         if not event.get("success", False):
             state["lastError"] = event.get("error") or "RPC command rejected"
             if isinstance(run, dict):
@@ -495,6 +511,8 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
 def prepare_runtime(p: dict[str, Path]) -> None:
     p["runtime"].mkdir(parents=True, exist_ok=True)
     p["runs"].mkdir(parents=True, exist_ok=True)
+    os.chmod(p["runtime"], 0o700)
+    os.chmod(p["runs"], 0o700)
     old = effective_state(p)
     if pid_alive(old.get("pid")):
         die(f"worker is already live with supervisor pid {old['pid']}")
@@ -632,6 +650,8 @@ def serve(args: argparse.Namespace) -> int:
             "eventLineCount": count_event_lines(p["events"]),
             "sessionId": previous_state.get("sessionId"),
             "requestedModel": args.model,
+            "actualProvider": previous_state.get("actualProvider"),
+            "actualModel": previous_state.get("actualModel"),
         }
         p["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
         save_state(p["state"], state)
@@ -640,7 +660,7 @@ def serve(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGHUP, request_stop)
 
         fifo_fd = os.open(p["fifo"], os.O_RDWR | os.O_NONBLOCK)
-        fifo_buffer = ""
+        fifo_buffer = b""
         stdout_buffer = b""
         selector = selectors.DefaultSelector()
         if child.stdout is None:
@@ -651,6 +671,7 @@ def serve(args: argparse.Namespace) -> int:
         initial_id = f"initial-{uuid.uuid4().hex}"
         open_run(state, p, prompt, initial_id)
         save_state(p["state"], state)
+        write_rpc(child, {"id": f"state-{uuid.uuid4().hex}", "type": "get_state"})
         write_rpc(child, {"id": initial_id, "type": "prompt", "message": prompt})
         print(f"worker '{slug}' started; session {p['session']}", flush=True)
         last_state_flush = time.monotonic()
@@ -691,12 +712,13 @@ def serve(args: argparse.Namespace) -> int:
                             state_dirty = True
                     else:
                         try:
-                            chunk = os.read(fifo_fd, 65536).decode("utf-8")
+                            chunk = os.read(fifo_fd, 65536)
                         except BlockingIOError:
-                            chunk = ""
+                            chunk = b""
                         fifo_buffer += chunk
-                        while "\n" in fifo_buffer:
-                            line, fifo_buffer = fifo_buffer.split("\n", 1)
+                        while b"\n" in fifo_buffer:
+                            raw_line, fifo_buffer = fifo_buffer.split(b"\n", 1)
+                            line = raw_line.decode("utf-8")
                             if not line.strip():
                                 continue
                             try:
@@ -819,13 +841,25 @@ def send_control(p: dict[str, Path], envelope: dict, timeout: float = 15, rpc_ac
         if error.errno in {errno.ENXIO, errno.ENOENT}:
             die("worker control channel is unavailable")
         raise
+    deadline = time.monotonic() + timeout
     try:
-        os.write(fd, payload)
+        offset = 0
+        while offset < len(payload):
+            try:
+                written = os.write(fd, payload[offset:])
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    die("timed out while writing the command to the control pipe")
+                select.select([], [fd], [], min(0.1, remaining))
+                continue
+            if written <= 0:
+                die("control pipe closed while writing the command")
+            offset += written
     finally:
         os.close(fd)
 
     field = "lastRpcResponseId" if rpc_ack else "lastControlRequestId"
-    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         current = effective_state(p)
         if current.get(field) == request_id:
@@ -893,9 +927,10 @@ def wait_worker(args: argparse.Namespace) -> int:
 def result(args: argparse.Namespace) -> int:
     p = worker_paths(args)
     state = require_state(p)
-    result_path = state.get("lastResultPath")
-    if not result_path:
+    run_id = state.get("lastRunId")
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
         die("worker has no completed run artifact")
+    result_path = p["runs"] / run_id / "result.json"
     try:
         run_result = json.loads(Path(result_path).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1011,6 +1046,7 @@ def clean(args: argparse.Namespace) -> int:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:6]}"
         archive = p["logs"] / stamp
         archive.mkdir(parents=True, exist_ok=False)
+        os.chmod(archive, 0o700)
         for name in ("events.jsonl", "stderr.log", "result.md", "state.json", "runs"):
             source = p["runtime"] / name
             if source.exists():

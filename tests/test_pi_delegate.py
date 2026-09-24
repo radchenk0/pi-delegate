@@ -97,6 +97,7 @@ class WorkerTest(unittest.TestCase):
         self.assertIn("привет", result["finalMessage"])
         self.assertFalse(any(path.startswith(".pi/") for path in result["touchedFiles"]))
         self.assertEqual((Path(first["lastResultPath"]).parent / "brief.md").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(Path(first["lastResultPath"]).stat().st_mode & 0o777, 0o600)
 
         self.command("follow-up", "happy", "second")
         second = self.wait_state("happy", lambda s: s.get("status") == "idle" and s.get("lastRunId") == "run-000002")
@@ -112,6 +113,16 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(result["runId"], "run-000001")
         self.assertEqual(result["queuedFollowUps"], 1)
         self.stop("queue")
+
+    def test_large_unicode_control_message_is_not_truncated(self):
+        self.start("large", "HOLD")
+        self.wait_state("large", lambda s: s.get("status") == "running")
+        message = "ёж" * 40000
+        self.command("follow-up", "large", message)
+        state = self.wait_state("large", lambda s: s.get("status") == "idle")
+        result = json.loads(Path(state["lastResultPath"]).read_text())
+        self.assertEqual(result["finalMessage"], "done: " + message)
+        self.stop("large")
 
     def test_rejected_prompt_and_pi_death_publish_results(self):
         self.start("reject", "REJECT")
