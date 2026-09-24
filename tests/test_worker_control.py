@@ -18,6 +18,50 @@ from base import WorkerTestCase
 
 
 class WorkerControlTest(WorkerTestCase):
+    def test_watch_replays_human_readable_events(self):
+        self.start("observe", "STREAM")
+        self.wait_state("observe", lambda s: s.get("status") == "idle")
+        watched = self.command(
+            "watch", "observe", "--history", "100", "--no-follow", "--color", "never",
+        )
+        self.assertIn("watching observe status=idle", watched.stdout)
+        self.assertIn("agent running", watched.stdout)
+        self.assertIn("assistant done: STREAM", watched.stdout)
+        self.assertEqual(watched.stdout.count("done: STREAM"), 1)
+        self.assertIn("agent settled", watched.stdout)
+        self.assertNotIn("\x1b[", watched.stdout)
+        self.assertIn("\\x1b[31m", watched.stdout)
+        self.stop("observe")
+
+    def test_watch_follows_until_settle(self):
+        self.start("observe-live", "HOLD")
+        self.wait_state("observe-live", lambda s: s.get("status") == "running")
+        watcher = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parents[1] / "scripts/pi_rpc_worker.py"),
+                "watch",
+                "observe-live",
+                "--history",
+                "0",
+                "--color",
+                "never",
+                "--cwd",
+                str(self.project),
+            ],
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.2)
+        self.command("abort", "observe-live")
+        stdout, stderr = watcher.communicate(timeout=5)
+        self.assertEqual(watcher.returncode, 0, stderr)
+        self.assertIn("agent settled", stdout)
+        self.assertIn("watch ended: status=idle", stdout)
+        self.stop("observe-live")
+
     def test_late_followup_without_open_run_opens_new_run(self):
         # Simulates the TOCTOU window: a client read "running" state, the run
         # settled, then the follow-up reached the supervisor. The supervisor

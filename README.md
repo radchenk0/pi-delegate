@@ -37,3 +37,9 @@ Runtime artifacts belong to the delegated project under `.pi/`. See
 [PLAN.md](PLAN.md) for the release contract and [SKILL.md](SKILL.md) for
 agent-facing usage. `CLAUDE.md` contains repository guidance for Claude Code;
 skill discovery still uses `SKILL.md`.
+
+`watch` renders the live Pi event stream in a terminal. When an orchestrator
+runs inside Herdr and the user requested Herdr monitoring, it can place the
+same watcher in a background sibling pane; outside Herdr it runs through the
+host's normal persistent process facility. See
+[live monitoring](references/live-monitoring.md).

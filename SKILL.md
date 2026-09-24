@@ -35,6 +35,27 @@ python3 /absolute/path/to/pi-delegate/scripts/pi_rpc_worker.py result task-name 
 `list` shows every worker slug under the project with its live status, PIDs,
 and last event; `status` shows one worker's full state JSON.
 
+### Live view
+
+Use `watch` for a read-only, human-readable live stream of assistant text,
+tool calls/results, compaction, blocking UI, and lifecycle events:
+
+```bash
+python3 /absolute/path/to/pi-delegate/scripts/pi_rpc_worker.py watch task-name --cwd /absolute/path/to/project
+```
+
+Add `--thinking` only when the user wants Pi's streamed thinking, `--raw` for
+the original JSONL, `--history 0` to start at the current end, or `--stay` to
+watch later runs too.
+
+When the user requested Herdr monitoring and `HERDR_ENV=1`, apply the installed
+`$herdr` skill: create a background sibling pane without stealing focus and
+run this same `watch` command there. The user can then observe the Pi worker in
+Herdr while the orchestrating agent continues in its pane. If `HERDR_ENV` is
+absent, Herdr control is forbidden; run `watch` through the host's normal
+persistent execution facility instead. See
+[live-monitoring.md](references/live-monitoring.md).
+
 Substitute the resolved skill and project paths. Prefer
 `--prompt-stdin` or `--prompt-file`; positional prompts are visible in the
 process list. Durable conversations live in `.pi/sessions/<slug>.jsonl` and

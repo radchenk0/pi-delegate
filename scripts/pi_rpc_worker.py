@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -1200,6 +1201,189 @@ def clean(args: argparse.Namespace) -> int:
     return 0
 
 
+def compact_json(value: object, limit: int) -> str:
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if limit > 0 and len(text) > limit:
+        text = text[: max(0, limit - 1)] + "…"
+    return safe_terminal(text)
+
+
+def safe_terminal(value: str) -> str:
+    return "".join(
+        character
+        if character in {"\n", "\t"} or (ord(character) >= 32 and ord(character) != 127)
+        else f"\\x{ord(character):02x}"
+        for character in value
+    )
+
+
+def result_text(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    parts = []
+    for item in value.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+            parts.append(str(item["text"]))
+    return "\n".join(parts)
+
+
+class WatchRenderer:
+    def __init__(self, *, thinking: bool, tool_output: int, color: bool) -> None:
+        self.thinking = thinking
+        self.tool_output = tool_output
+        self.color = color
+        self.stream: str | None = None
+        self.turn_had_text = False
+
+    def paint(self, code: str, value: str) -> str:
+        return f"\033[{code}m{value}\033[0m" if self.color else value
+
+    def end_stream(self) -> None:
+        if self.stream:
+            print(flush=True)
+            self.stream = None
+
+    def label(self, value: str, code: str = "36") -> None:
+        self.end_stream()
+        print(self.paint(code, value), flush=True)
+
+    def delta(self, kind: str, value: str) -> None:
+        if not value:
+            return
+        if self.stream != kind:
+            self.end_stream()
+            prefix = "thinking  " if kind == "thinking" else "assistant "
+            print(self.paint("2;35" if kind == "thinking" else "32", prefix), end="", flush=True)
+            self.stream = kind
+        print(safe_terminal(value), end="", flush=True)
+
+    def render(self, event: dict) -> None:
+        event_type = event.get("type")
+        if event_type == "message_update":
+            update = event.get("assistantMessageEvent") or {}
+            update_type = update.get("type")
+            if update_type == "thinking_delta" and self.thinking:
+                self.delta("thinking", str(update.get("delta") or ""))
+            elif update_type == "text_delta":
+                self.turn_had_text = True
+                self.delta("assistant", str(update.get("delta") or ""))
+            elif update_type in {"thinking_end", "text_end"}:
+                self.end_stream()
+            return
+        if event_type == "agent_start":
+            self.label("▶ agent running", "1;36")
+        elif event_type == "agent_settled":
+            self.label("✓ agent settled", "1;32")
+        elif event_type == "turn_start":
+            self.turn_had_text = False
+            self.label("↻ turn", "36")
+        elif event_type == "message_end":
+            if not self.turn_had_text:
+                text = assistant_text(event)
+                if text:
+                    self.delta("assistant", text)
+                    self.end_stream()
+        elif event_type == "tool_execution_start":
+            name = str(event.get("toolName") or "tool")
+            args = compact_json(event.get("args") or {}, 800)
+            self.label(f"→ {name} {args}", "33")
+        elif event_type == "tool_execution_end":
+            name = str(event.get("toolName") or "tool")
+            result = event.get("result")
+            failed = bool(
+                event.get("isError") or (isinstance(result, dict) and result.get("isError"))
+            )
+            self.label(f"← {name} {'error' if failed else 'ok'}", "31" if failed else "33")
+            output = result_text(result)
+            if output and self.tool_output:
+                if len(output) > self.tool_output:
+                    output = output[: self.tool_output - 1] + "…"
+                print(safe_terminal(output), flush=True)
+        elif event_type == "extension_ui_request":
+            method = event.get("method")
+            if method in UI_DIALOG_METHODS:
+                self.label(f"⚠ UI blocked: {method} ({event.get('id')})", "1;31")
+        elif event_type == "compaction_start":
+            self.label("◇ compaction started", "35")
+        elif event_type == "compaction_end":
+            self.label("◇ compaction finished", "35")
+        elif event_type == "response" and not event.get("success", False):
+            self.label(f"✗ RPC rejected: {event.get('error') or 'unknown error'}", "1;31")
+
+
+def watch(args: argparse.Namespace) -> int:
+    p = worker_paths(args)
+    if args.history < 0 or args.tool_output < 0 or args.poll <= 0:
+        die("--history and --tool-output must be non-negative; --poll must be positive")
+    state = load_state(p["state"])
+    if not state:
+        die(f"no worker state for '{args.slug}' in {p['cwd']}")
+    try:
+        handle = p["events"].open("rb")
+    except FileNotFoundError:
+        die(f"worker has no event stream: {p['events']}")
+
+    color = args.color == "always" or (args.color == "auto" and sys.stdout.isatty())
+    renderer = WatchRenderer(thinking=args.thinking, tool_output=args.tool_output, color=color)
+    print(
+        f"watching {args.slug} status={state.get('status')} "
+        f"model={state.get('actualProvider') or '?'}:{state.get('actualModel') or '?'}",
+        flush=True,
+    )
+    try:
+        if args.history:
+            history = deque(handle, maxlen=args.history)
+            for raw in history:
+                try:
+                    event = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if args.raw:
+                    print(json.dumps(event, ensure_ascii=False), flush=True)
+                else:
+                    renderer.render(event)
+        else:
+            handle.seek(0, os.SEEK_END)
+
+        if args.no_follow:
+            renderer.end_stream()
+            return 0
+
+        while True:
+            position = handle.tell()
+            raw = handle.readline()
+            if raw:
+                if not raw.endswith(b"\n"):
+                    handle.seek(position)
+                    time.sleep(args.poll)
+                    continue
+                try:
+                    event = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if args.raw:
+                    print(json.dumps(event, ensure_ascii=False), flush=True)
+                else:
+                    renderer.render(event)
+                continue
+
+            current = load_state(p["state"])
+            if not current:
+                renderer.end_stream()
+                print("watch ended: worker runtime disappeared", file=sys.stderr, flush=True)
+                return 2
+            if not args.stay and current.get("status") in {"idle", "stopped", "dead", "orphaned"}:
+                renderer.end_stream()
+                print(f"watch ended: status={current.get('status')}", flush=True)
+                return 0 if current.get("status") in {"idle", "stopped"} else 2
+            time.sleep(args.poll)
+    except KeyboardInterrupt:
+        renderer.end_stream()
+        return 130
+    finally:
+        handle.close()
+
+
 def add_cwd(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", default=os.getcwd())
 
@@ -1222,6 +1406,19 @@ def build_parser() -> argparse.ArgumentParser:
     list_p = sub.add_parser("list")
     add_cwd(list_p)
     list_p.set_defaults(func=list_workers)
+
+    watch_p = sub.add_parser("watch", help="render the worker event stream as a live read-only view")
+    watch_p.add_argument("slug")
+    watch_p.add_argument("--history", type=int, default=200, help="replay this many recent events first; 0 starts at EOF")
+    watch_p.add_argument("--thinking", action="store_true", help="include streamed model thinking")
+    watch_p.add_argument("--tool-output", type=int, default=1200, help="maximum tool-result characters to print; 0 hides output")
+    watch_p.add_argument("--raw", action="store_true", help="print raw JSON events")
+    watch_p.add_argument("--no-follow", action="store_true", help="replay history and exit")
+    watch_p.add_argument("--stay", action="store_true", help="keep watching across settled runs")
+    watch_p.add_argument("--poll", type=float, default=0.2)
+    watch_p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    add_cwd(watch_p)
+    watch_p.set_defaults(func=watch)
 
     for name in ("status", "result"):
         item = sub.add_parser(name)

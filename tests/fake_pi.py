@@ -87,6 +87,10 @@ for raw in sys.stdin.buffer:
             emit({"type": "extension_ui_request", "id": "ui-1", "method": "confirm"})
             continue
         emit({"type": "turn_start"})
+        if "STREAM" in message:
+            emit({"type": "message_update", "assistantMessageEvent": {"type": "text_start", "contentIndex": 0}})
+            emit({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": f"done: {message}\u001b[31m"}})
+            emit({"type": "message_update", "assistantMessageEvent": {"type": "text_end", "contentIndex": 0}})
         emit({
             "type": "message_end",
             "message": {
