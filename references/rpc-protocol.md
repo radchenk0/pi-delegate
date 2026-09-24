@@ -20,11 +20,16 @@ Read this reference only when debugging, extending, or bypassing the bundled hel
 {"id":"request-id","type":"follow_up","message":"Process after the running turn"}
 {"id":"request-id","type":"abort"}
 {"id":"request-id","type":"get_state"}
+{"id":"ui-request-id","type":"extension_ui_response","value":"Allow"}
+{"id":"ui-request-id","type":"extension_ui_response","confirmed":true}
+{"id":"ui-request-id","type":"extension_ui_response","cancelled":true}
 ```
 
-Correlate acceptance with the Pi `response` carrying the same `id`. A successful FIFO write confirms transport to the supervisor only.
+Correlate acceptance with the Pi `response` carrying the same `id`. A successful FIFO write confirms transport to the supervisor only. The `abort` acknowledgement arrives only after the agent has settled, so an ack implies the run is already closed. `extension_ui_response` has no acknowledgement of its own; the id must be the id from the matching `extension_ui_request`, and exactly one of `value`, `confirmed`, or `cancelled` is sent.
 
 When idle, send a new `prompt`. While streaming, `follow_up` queues later work. The default follow-up mode processes one queued message per completion; `agent_settled` is emitted only after retry, compaction, and queued continuations are exhausted. Do not equate one `agent_settled` with one queued message.
+
+The idle/busy read and the write race: a `follow_up` composed against stale "running" state can reach the supervisor after settle. The supervisor treats a `follow_up` with no open run as a new `prompt` (a fresh run with its own brief and result) instead of forwarding it to an idle Pi.
 
 ## Events to watch
 
@@ -34,7 +39,7 @@ When idle, send a new `prompt`. While streaming, `follow_up` queues later work. 
 - `tool_execution_start` and `tool_execution_end`: tool activity;
 - `message_end`: completed assistant message;
 - `agent_settled`: no automatic retry or queued continuation remains;
-- `extension_ui_request`: an extension requested UI interaction and may be blocking headless execution.
+- `extension_ui_request`: an extension requested UI interaction. Dialog methods (`select`, `confirm`, `input`, `editor`) block headless execution until a matching `extension_ui_response` arrives; `notify`, `setStatus`, `setWidget`, `setTitle`, and `set_editor_text` are fire-and-forget. A response whose id matches no pending dialog is ignored by Pi.
 
 Persist the raw stream for diagnosis. A cached result is current only when a fresh assistant `message_end` occurred during the operation that reached the latest `agent_settled`.
 

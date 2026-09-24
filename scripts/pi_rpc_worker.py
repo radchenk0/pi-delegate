@@ -27,6 +27,10 @@ RUN_ID_RE = re.compile(r"^run-[0-9]{6}$")
 STATE_FLUSH_INTERVAL = 0.5
 PROCESS_GRACE_SECONDS = 2.0
 RESULT_SCHEMA = "pi-delegate.result.v1"
+# Extension UI methods per the Pi RPC docs: dialog methods block the agent
+# until an extension_ui_response arrives; the rest are fire-and-forget.
+UI_DIALOG_METHODS = {"select", "confirm", "input", "editor"}
+UI_FIRE_AND_FORGET_METHODS = {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"}
 
 
 def die(message: str, code: int = 2) -> NoReturn:
@@ -86,6 +90,7 @@ def utc_now() -> str:
 def write_private_text(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(value)
 
@@ -116,9 +121,19 @@ def git_snapshot(cwd: Path) -> dict | None:
     root = command_output(["git", "rev-parse", "--show-toplevel"], cwd)
     if root is None:
         return None
-    porcelain_text = command_output(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd)
-    if porcelain_text is None:
-        return None
+    degraded: list[str] = []
+
+    def git_output(label: str, argv: list[str]) -> str:
+        text = command_output(argv, cwd)
+        if text is None:
+            degraded.append(f"{label} failed or timed out")
+            return ""
+        return text
+
+    porcelain_text = git_output(
+        "git status --porcelain=v1 --untracked-files=all",
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+    )
     try:
         relative_cwd = cwd.resolve().relative_to(Path(root).resolve())
     except ValueError:
@@ -132,18 +147,22 @@ def git_snapshot(cwd: Path) -> dict | None:
         line for line in porcelain_text.splitlines()
         if line and external(porcelain_path(line))
     ]
-    staged_text = command_output(["git", "diff", "--cached", "--name-only"], cwd) or ""
-    unstaged_text = command_output(["git", "diff", "--name-only"], cwd) or ""
+    staged_text = git_output("git diff --cached --name-only", ["git", "diff", "--cached", "--name-only"])
+    unstaged_text = git_output("git diff --name-only", ["git", "diff", "--name-only"])
     stash_text = command_output(["git", "stash", "list", "--format=%gd %H"], cwd)
+    if stash_text is None:
+        degraded.append("git stash list failed or timed out")
+        stash_text = ""
     return {
         "root": root,
-        "head": command_output(["git", "rev-parse", "HEAD"], cwd),
+        "head": git_output("git rev-parse HEAD", ["git", "rev-parse", "HEAD"]),
         "porcelain": porcelain,
         "paths": sorted({porcelain_path(line) for line in porcelain}),
         "staged": sorted(path for path in staged_text.splitlines() if path and external(path)),
         "unstaged": sorted(path for path in unstaged_text.splitlines() if path and external(path)),
         "untracked": sorted(porcelain_path(line) for line in porcelain if line.startswith("?? ")),
-        "stash": [] if stash_text is None else [line for line in stash_text.splitlines() if line],
+        "stash": [line for line in stash_text.splitlines() if line],
+        "degraded": degraded,
     }
 
 
@@ -380,7 +399,16 @@ def finalize_run(
         "gitAfter": after,
         "touchedFiles": changed_paths(before, after),
         "gitEvidence": {
-            "attribution": "unavailable" if before is None or after is None else "ambiguous" if before.get("porcelain") else "clean-baseline",
+            "attribution": (
+                "unavailable"
+                if before is None or after is None
+                else "degraded"
+                if (before.get("degraded") or after.get("degraded"))
+                else "ambiguous"
+                if before.get("porcelain")
+                else "clean-baseline"
+            ),
+            "snapshotDegraded": sorted(set((before or {}).get("degraded", [])) | set((after or {}).get("degraded", []))),
             "headMoved": bool(before and after and before.get("head") != after.get("head")),
             "stashChanged": bool(before and after and before.get("stash") != after.get("stash")),
             "stagedChangesAppeared": sorted(after_staged - before_staged),
@@ -445,6 +473,7 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
         state["settleGeneration"] += 1
         state["status"] = "idle"
         state["queuedFollowUps"] = 0
+        state["pendingUi"] = None
         if isinstance(run, dict) and state["settleGeneration"] >= int(run.get("settleTarget", 0)):
             final_status = "aborted" if run.get("abortRequested") else "completed"
             final_error = None
@@ -462,8 +491,15 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
         print(f"worker '{slug}' settled", flush=True)
     elif event_type == "extension_ui_request":
         method = event.get("method")
-        if method not in {"setStatus", "notify"}:
-            state["lastError"] = f"possible blocking UI request: {method}"
+        if method in UI_DIALOG_METHODS:
+            request_id = event.get("id")
+            if not isinstance(request_id, str) or not request_id:
+                state["lastError"] = f"blocking extension UI request has no valid id: {method}"
+            else:
+                state["pendingUi"] = {"id": request_id, "method": method}
+            force_save = True
+        elif method not in UI_FIRE_AND_FORGET_METHODS:
+            state["lastError"] = f"unrecognized extension UI request: {method}"
             force_save = True
     elif event_type == "response":
         state["lastRpcResponseId"] = event.get("id")
@@ -491,7 +527,7 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
 
     text = assistant_text(event)
     if text:
-        p["result"].write_text(text + "\n", encoding="utf-8")
+        write_private_text(p["result"], text + "\n")
         state["resultFresh"] = True
         state["lastResultTurn"] = state["turnSequence"]
         run = state.get("openRun")
@@ -645,8 +681,10 @@ def serve(args: argparse.Namespace) -> int:
             "lastEvent": None,
             "lastError": None,
             "lastControlRequestId": None,
+            "lastControlSuccess": None,
             "lastRpcResponseId": None,
             "lastRpcSuccess": None,
+            "pendingUi": None,
             "eventLineCount": count_event_lines(p["events"]),
             "sessionId": previous_state.get("sessionId"),
             "requestedModel": args.model,
@@ -730,6 +768,7 @@ def serve(args: argparse.Namespace) -> int:
                             request_id = envelope.get("requestId")
                             if envelope.get("action") == "stop":
                                 state["lastControlRequestId"] = request_id
+                                state["lastControlSuccess"] = True
                                 save_state(p["state"], state)
                                 stop_requested = True
                                 break
@@ -737,6 +776,27 @@ def serve(args: argparse.Namespace) -> int:
                             if not isinstance(rpc, dict):
                                 state["lastError"] = "control request has no RPC command"
                                 state["lastControlRequestId"] = request_id
+                                state["lastControlSuccess"] = False
+                                force_save = True
+                                continue
+                            if rpc.get("type") == "extension_ui_response":
+                                # The id must be the pending dialog's id, not the
+                                # control request id; validate before forwarding.
+                                pending = state.get("pendingUi")
+                                if not isinstance(pending, dict) or rpc.get("id") != pending.get("id"):
+                                    state["lastError"] = "extension_ui_response does not match a pending UI request"
+                                    state["lastControlRequestId"] = request_id
+                                    state["lastControlSuccess"] = False
+                                    force_save = True
+                                    continue
+                                response = {"type": "extension_ui_response", "id": pending["id"]}
+                                for key in ("value", "confirmed", "cancelled"):
+                                    if key in rpc:
+                                        response[key] = rpc[key]
+                                write_rpc(child, response)
+                                state["pendingUi"] = None
+                                state["lastControlRequestId"] = request_id
+                                state["lastControlSuccess"] = True
                                 force_save = True
                                 continue
                             rpc["id"] = request_id
@@ -751,16 +811,24 @@ def serve(args: argparse.Namespace) -> int:
                                 state["status"] = "queued"
                                 state["settledResultFresh"] = False
                             elif rpc_type == "follow_up":
-                                state["status"] = "queued"
-                                state["queuedFollowUps"] += 1
                                 if isinstance(state.get("openRun"), dict):
                                     state["openRun"]["queuedFollowUps"] += 1
+                                    state["queuedFollowUps"] += 1
+                                    state["status"] = "queued"
+                                else:
+                                    # Race: the client read state before the previous run settled.
+                                    # Open a new run so this work still gets run boundaries
+                                    # and a result artifact.
+                                    rpc["type"] = "prompt"
+                                    open_run(state, p, str(rpc.get("message") or ""), request_id)
+                                    state["status"] = "queued"
                             elif rpc_type == "steer" and isinstance(state.get("openRun"), dict):
                                 state["openRun"]["steers"] += 1
                             elif rpc_type == "abort" and isinstance(state.get("openRun"), dict):
                                 state["openRun"]["abortRequested"] = True
                             write_rpc(child, rpc)
                             state["lastControlRequestId"] = request_id
+                            state["lastControlSuccess"] = True
                             force_save = True
 
                     now = time.monotonic()
@@ -865,6 +933,8 @@ def send_control(p: dict[str, Path], envelope: dict, timeout: float = 15, rpc_ac
         if current.get(field) == request_id:
             if rpc_ack and not current.get("lastRpcSuccess"):
                 die(current.get("lastError") or "Pi rejected the RPC command")
+            if not rpc_ack and current.get("lastControlSuccess") is False:
+                die(current.get("lastError") or "supervisor rejected the control command")
             return current
         if current.get("status") in {"dead", "orphaned", "stopped"}:
             die(f"worker became {current['status']} before acknowledging the command")
@@ -928,21 +998,35 @@ def result(args: argparse.Namespace) -> int:
     p = worker_paths(args)
     state = require_state(p)
     run_id = state.get("lastRunId")
-    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
-        die("worker has no completed run artifact")
-    result_path = p["runs"] / run_id / "result.json"
-    try:
-        run_result = json.loads(Path(result_path).read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        die(f"state points to a missing run artifact: {result_path}")
-    except json.JSONDecodeError as error:
-        die(f"run artifact is invalid JSON: {error}")
-    if args.json:
-        print(json.dumps(run_result, ensure_ascii=False, indent=2))
-    elif run_result.get("finalMessage"):
-        print(str(run_result["finalMessage"]).rstrip())
-    else:
-        die(run_result.get("error") or f"run ended with status {run_result.get('status')}")
+    if isinstance(run_id, str) and RUN_ID_RE.fullmatch(run_id):
+        result_path = p["runs"] / run_id / "result.json"
+        try:
+            run_result = json.loads(Path(result_path).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            die(f"state points to a missing run artifact: {result_path}")
+        except json.JSONDecodeError as error:
+            die(f"run artifact is invalid JSON: {error}")
+        if args.json:
+            print(json.dumps(run_result, ensure_ascii=False, indent=2))
+        elif run_result.get("finalMessage"):
+            print(str(run_result["finalMessage"]).rstrip())
+        else:
+            die(run_result.get("error") or f"run ended with status {run_result.get('status')}")
+        return 0
+    # Read-only fallback for state imported from the legacy helper: it cached
+    # the settled assistant text in result.md without any run artifact. Only
+    # reachable when no run artifact exists and the cache was marked fresh by
+    # a settled turn (effective_state may already have transitioned the
+    # status, so the freshness flag, not the status, is the gate).
+    if state.get("settledResultFresh") and p["result"].exists():
+        print(
+            "warning: legacy state has no run artifact; showing the cached result.md "
+            "(no run evidence; verify before relying on it)",
+            file=sys.stderr,
+        )
+        print(p["result"].read_text(encoding="utf-8").rstrip())
+        return 0
+    die("worker has no completed run artifact")
     return 0
 
 
@@ -979,6 +1063,41 @@ def abort(args: argparse.Namespace) -> int:
     return 0
 
 
+def ui_respond(args: argparse.Namespace) -> int:
+    p = worker_paths(args)
+    state = require_state(p)
+    pending = state.get("pendingUi")
+    if not isinstance(pending, dict):
+        die("worker has no pending blocking UI request; nothing to answer")
+    method = pending.get("method")
+    if method == "confirm" and args.value is not None:
+        die("confirm dialogs require --confirmed or --cancelled")
+    if method != "confirm" and args.confirmed:
+        die(f"{method} dialogs require --value or --cancelled")
+    if args.value is not None:
+        fields = {"value": args.value}
+    elif args.confirmed:
+        fields = {"confirmed": True}
+    elif args.cancelled:
+        fields = {"cancelled": True}
+    else:
+        die("provide exactly one of --value, --confirmed, or --cancelled")
+    send_control(
+        p,
+        {
+            "action": "rpc",
+            "command": {"type": "extension_ui_response", "id": pending.get("id"), **fields},
+        },
+        timeout=args.timeout,
+        rpc_ack=False,
+    )
+    print(
+        f"UI response accepted by supervisor for '{args.slug}' "
+        f"({pending.get('method')} dialog {pending.get('id')})"
+    )
+    return 0
+
+
 def stop(args: argparse.Namespace) -> int:
     p = worker_paths(args)
     state = require_state(p)
@@ -1006,25 +1125,48 @@ def recover(args: argparse.Namespace) -> int:
         state = require_state(p)
         if pid_alive(state.get("pid")):
             die("supervisor is still alive; use stop instead")
-        if not pid_alive(state.get("piPid")):
-            print(f"worker '{args.slug}' has no live orphan Pi process")
+        if pid_alive(state.get("piPid")):
+            if not pi_process_matches(state):
+                if not args.forget:
+                    die(
+                        "stored Pi PID belongs to a different process; refusing to signal it; "
+                        "rerun with --forget to clear the state without touching that process"
+                    )
+                # Explicit escape: never signal the mismatched process; keep all
+                # run/result/session evidence and just stop tracking the PIDs.
+                state["status"] = "stopped"
+                state["pid"] = None
+                state["piPid"] = None
+                state["piPgid"] = None
+                state["lastError"] = (
+                    "orphan state cleared with recover --forget; the stored PID no longer "
+                    "matched the expected Pi session and was left untouched"
+                )
+                save_state(p["state"], state)
+                print(f"forgot orphan state for '{args.slug}'; the external process was left untouched")
+                return 0
+            pgid = int(state.get("piPgid") or state["piPid"])
+            os.killpg(pgid, signal.SIGTERM)
+            deadline = time.monotonic() + args.timeout
+            while time.monotonic() < deadline and group_alive(pgid):
+                time.sleep(0.1)
+            if group_alive(pgid):
+                os.killpg(pgid, signal.SIGKILL)
+            state["status"] = "stopped"
+            state["pid"] = None
+            state["piPid"] = None
+            state["piPgid"] = None
+            state["lastError"] = "orphan process group recovered"
+            save_state(p["state"], state)
+            print(f"recovered orphan worker '{args.slug}'; session preserved")
             return 0
-        if not pi_process_matches(state):
-            die("stored Pi PID belongs to a different process; refusing to signal it")
-        pgid = int(state.get("piPgid") or state["piPid"])
-        os.killpg(pgid, signal.SIGTERM)
-        deadline = time.monotonic() + args.timeout
-        while time.monotonic() < deadline and group_alive(pgid):
-            time.sleep(0.1)
-        if group_alive(pgid):
-            os.killpg(pgid, signal.SIGKILL)
         state["status"] = "stopped"
         state["pid"] = None
         state["piPid"] = None
         state["piPgid"] = None
-        state["lastError"] = "orphan process group recovered"
+        state["lastError"] = "orphan process was already gone; stale process state cleared"
         save_state(p["state"], state)
-        print(f"recovered orphan worker '{args.slug}'; session preserved")
+        print(f"cleared stale orphan state for '{args.slug}'; no live Pi process was signaled")
         return 0
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -1109,12 +1251,33 @@ def build_parser() -> argparse.ArgumentParser:
     add_cwd(abort_p)
     abort_p.set_defaults(func=abort)
 
-    for name in ("stop", "recover"):
-        item = sub.add_parser(name)
-        item.add_argument("slug")
-        item.add_argument("--timeout", type=float, default=10)
-        add_cwd(item)
-        item.set_defaults(func=globals()[name])
+    stop_p = sub.add_parser("stop", help="stop supervisor and Pi, preserve session and result evidence")
+    stop_p.add_argument("slug")
+    stop_p.add_argument("--timeout", type=float, default=30)
+    add_cwd(stop_p)
+    stop_p.set_defaults(func=stop)
+
+    recover_p = sub.add_parser("recover", help="kill an orphaned Pi process after supervisor death")
+    recover_p.add_argument("slug")
+    recover_p.add_argument("--timeout", type=float, default=15)
+    recover_p.add_argument(
+        "--forget",
+        action="store_true",
+        help="clear the orphan state without signaling the stored PID when it no longer "
+        "matches the expected Pi session (evidence is preserved, the external process is untouched)",
+    )
+    add_cwd(recover_p)
+    recover_p.set_defaults(func=recover)
+
+    ui_p = sub.add_parser("ui-respond", help="answer a pending blocking extension UI request")
+    ui_p.add_argument("slug")
+    ui_choice = ui_p.add_mutually_exclusive_group()
+    ui_choice.add_argument("--value", help="answer for select/input/editor dialogs")
+    ui_choice.add_argument("--confirmed", action="store_true", help="confirm a confirm dialog")
+    ui_choice.add_argument("--cancelled", action="store_true", help="dismiss any dialog")
+    ui_p.add_argument("--timeout", type=float, default=15)
+    add_cwd(ui_p)
+    ui_p.set_defaults(func=ui_respond)
 
     clean_p = sub.add_parser("clean")
     clean_p.add_argument("slug")

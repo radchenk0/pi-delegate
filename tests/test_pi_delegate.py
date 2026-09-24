@@ -2,93 +2,23 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
+
+from base import FAKE_SOURCE, HELPER, INSTALLER, ROOT, WorkerTestCase
 
 
-ROOT = Path(__file__).resolve().parents[1]
-HELPER = ROOT / "scripts" / "pi_rpc_worker.py"
-INSTALLER = ROOT / "scripts" / "install.py"
-FAKE_SOURCE = ROOT / "tests" / "fake_pi.py"
-
-
-class WorkerTest(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.project = Path(self.temp.name) / "project"
-        self.bin = Path(self.temp.name) / "bin"
-        self.project.mkdir()
-        self.bin.mkdir()
-        fake = self.bin / "pi"
-        fake.write_bytes(FAKE_SOURCE.read_bytes())
-        fake.chmod(0o755)
-        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
-        self.env = os.environ.copy()
-        self.env["PATH"] = f"{self.bin}{os.pathsep}{self.env['PATH']}"
-        self.env["PYTHONPYCACHEPREFIX"] = str(Path(self.temp.name) / "pycache")
-        self.processes = []
-
-    def tearDown(self):
-        for process in self.processes:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None and not stream.closed:
-                    stream.close()
-        self.temp.cleanup()
-
-    def command(self, *args, check=True, env=None):
-        return subprocess.run(
-            [sys.executable, str(HELPER), *args, "--cwd", str(self.project)],
-            env=env or self.env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=check,
-        )
-
-    def start(self, slug, prompt, stdin=False):
-        argv = [sys.executable, str(HELPER), "serve", slug, "--cwd", str(self.project)]
-        if stdin:
-            argv.append("--prompt-stdin")
-            proc = subprocess.Popen(argv, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            proc.stdin.write(prompt)
-            proc.stdin.close()
-        else:
-            brief = Path(self.temp.name) / f"{slug}.md"
-            brief.write_text(prompt, encoding="utf-8")
-            argv.extend(["--prompt-file", str(brief)])
-            proc = subprocess.Popen(argv, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.processes.append(proc)
-        return proc
-
-    def wait_state(self, slug, predicate, timeout=5):
-        path = self.project / ".pi" / "workers" / slug / "state.json"
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                state = json.loads(path.read_text(encoding="utf-8"))
-            except (FileNotFoundError, json.JSONDecodeError):
-                time.sleep(0.03)
-                continue
-            if predicate(state):
-                return state
-            time.sleep(0.03)
-        self.fail(f"state condition not reached for {slug}")
-
-    def stop(self, slug):
-        self.command("stop", slug)
-
+class WorkerTest(WorkerTestCase):
     def test_completed_run_stdin_utf8_and_idle_followup(self):
+        legacy_result = self.project / ".pi/workers/happy/result.md"
+        legacy_result.parent.mkdir(parents=True)
+        legacy_result.write_text("old", encoding="utf-8")
+        legacy_result.chmod(0o644)
         self.start("happy", "UTF8 привет", stdin=True)
         first = self.wait_state("happy", lambda s: s.get("status") == "idle")
         result = json.loads(Path(first["lastResultPath"]).read_text(encoding="utf-8"))
@@ -98,6 +28,7 @@ class WorkerTest(unittest.TestCase):
         self.assertFalse(any(path.startswith(".pi/") for path in result["touchedFiles"]))
         self.assertEqual((Path(first["lastResultPath"]).parent / "brief.md").stat().st_mode & 0o777, 0o600)
         self.assertEqual(Path(first["lastResultPath"]).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(legacy_result.stat().st_mode & 0o777, 0o600)
 
         self.command("follow-up", "happy", "second")
         second = self.wait_state("happy", lambda s: s.get("status") == "idle" and s.get("lastRunId") == "run-000002")
@@ -190,6 +121,53 @@ class InstallerTest(unittest.TestCase):
             self.assertFalse((Path(home) / ".claude/skills/pi-delegate").exists())
             subprocess.run([sys.executable, str(INSTALLER), "--target", "claude"], env=env, check=True, capture_output=True, text=True)
             self.assertEqual((Path(home) / ".claude/skills/pi-delegate").resolve(), ROOT)
+
+    def test_refuses_unrelated_path_and_replace_backs_up(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = os.environ.copy()
+            env["HOME"] = home
+            target = Path(home) / ".agents" / "skills" / "pi-delegate"
+            target.mkdir(parents=True)
+            (target / "README.md").write_text("someone else's skill", encoding="utf-8")
+            refused = subprocess.run(
+                [sys.executable, str(INSTALLER)], env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(refused.returncode, 2, refused.stderr)
+            self.assertIn("refusing to replace existing path", refused.stderr)
+            self.assertEqual((target / "README.md").read_text(encoding="utf-8"), "someone else's skill")
+
+            replaced = subprocess.run(
+                [sys.executable, str(INSTALLER), "--replace"], env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(replaced.returncode, 0, replaced.stderr)
+            self.assertEqual(target.resolve(), ROOT)
+            backups = sorted(
+                path for path in target.parent.iterdir()
+                if path.name.startswith("pi-delegate.backup-")
+            )
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                (backups[0] / "README.md").read_text(encoding="utf-8"), "someone else's skill",
+            )
+
+    def test_uninstall_removes_symlink_and_keeps_backup(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = os.environ.copy()
+            env["HOME"] = home
+            subprocess.run([sys.executable, str(INSTALLER)], env=env, check=True, capture_output=True, text=True)
+            target = Path(home) / ".agents" / "skills" / "pi-delegate"
+            self.assertTrue(target.is_symlink())
+            result = subprocess.run(
+                [sys.executable, str(INSTALLER), "--uninstall"], env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(target.exists())
+            self.assertFalse(target.is_symlink())
+            second = subprocess.run(
+                [sys.executable, str(INSTALLER), "--uninstall"], env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("absent:", second.stdout)
 
 
 if __name__ == "__main__":
