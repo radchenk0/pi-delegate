@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import errno
 import fcntl
 import json
@@ -23,10 +23,12 @@ import uuid
 
 SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 STATE_FLUSH_INTERVAL = 0.5
+PROCESS_GRACE_SECONDS = 2.0
+RESULT_SCHEMA = "pi-delegate.result.v1"
 
 
 def die(message: str, code: int = 2) -> NoReturn:
-    print(f"pi-rpc-worker: {message}", file=sys.stderr)
+    print(f"pi-delegate: {message}", file=sys.stderr)
     raise SystemExit(code)
 
 
@@ -41,6 +43,7 @@ def paths(cwd: Path, slug: str) -> dict[str, Path]:
     return {
         "cwd": cwd,
         "runtime": runtime,
+        "runs": runtime / "runs",
         "session": cwd / ".pi" / "sessions" / f"{slug}.jsonl",
         "lock": cwd / ".pi" / "sessions" / f"{slug}.lock",
         "logs": cwd / ".pi" / "logs" / slug,
@@ -65,6 +68,99 @@ def save_state(path: Path, state: dict) -> None:
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temp, path)
+
+
+def atomic_write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def write_private_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(value)
+
+
+def command_output(argv: list[str], cwd: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return completed.stdout.rstrip("\n") if completed.returncode == 0 else None
+
+
+def porcelain_path(line: str) -> str:
+    value = line[3:] if len(line) >= 4 else line
+    if " -> " in value:
+        value = value.split(" -> ", 1)[1]
+    return value.strip('"')
+
+
+def git_snapshot(cwd: Path) -> dict | None:
+    root = command_output(["git", "rev-parse", "--show-toplevel"], cwd)
+    if root is None:
+        return None
+    porcelain_text = command_output(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd)
+    if porcelain_text is None:
+        return None
+    try:
+        relative_cwd = cwd.resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        relative_cwd = Path()
+    internal_root = (relative_cwd / ".pi").as_posix()
+
+    def external(path: str) -> bool:
+        return path != internal_root and not path.startswith(internal_root + "/")
+
+    porcelain = [
+        line for line in porcelain_text.splitlines()
+        if line and external(porcelain_path(line))
+    ]
+    staged_text = command_output(["git", "diff", "--cached", "--name-only"], cwd) or ""
+    unstaged_text = command_output(["git", "diff", "--name-only"], cwd) or ""
+    stash_text = command_output(["git", "stash", "list", "--format=%gd %H"], cwd)
+    return {
+        "root": root,
+        "head": command_output(["git", "rev-parse", "HEAD"], cwd),
+        "porcelain": porcelain,
+        "paths": sorted({porcelain_path(line) for line in porcelain}),
+        "staged": sorted(path for path in staged_text.splitlines() if path and external(path)),
+        "unstaged": sorted(path for path in unstaged_text.splitlines() if path and external(path)),
+        "untracked": sorted(porcelain_path(line) for line in porcelain if line.startswith("?? ")),
+        "stash": [] if stash_text is None else [line for line in stash_text.splitlines() if line],
+    }
+
+
+def merge_numeric(target: dict, source: dict) -> None:
+    for key, value in source.items():
+        if isinstance(value, dict):
+            child = target.setdefault(key, {})
+            if isinstance(child, dict):
+                merge_numeric(child, value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            target[key] = target.get(key, 0) + value
+
+
+def stderr_tail(path: Path, limit: int = 20) -> list[str]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return []
+    return [line for line in lines if line.strip()][-limit:]
 
 
 def pid_alive(pid: object) -> bool:
@@ -117,13 +213,32 @@ def effective_state(p: dict[str, Path], persist: bool = True) -> dict:
     # Process identity inspection is reserved for the privileged recover path.
     pi_live = not supervisor_live and pid_alive(state.get("piPid"))
     previous = state.get("status")
+    finalized = False
     if not supervisor_live and pi_live:
         state["status"] = "orphaned"
         state["lastError"] = "supervisor is dead while its Pi process is still alive"
+        if persist and state.get("openRun"):
+            finalized = finalize_run(
+                state,
+                p,
+                "orphaned",
+                error=state["lastError"],
+                abort_origin="supervisor-loss",
+                worker_alive=True,
+            ) is not None
     elif not supervisor_live and previous not in {"stopped", "dead"}:
         state["status"] = "dead"
         state["lastError"] = state.get("lastError") or "supervisor process is not alive"
-    if persist and state.get("status") != previous:
+        if persist and state.get("openRun"):
+            finalized = finalize_run(
+                state,
+                p,
+                "aborted",
+                error=state["lastError"],
+                abort_origin="supervisor-loss",
+                worker_alive=False,
+            ) is not None
+    if persist and (state.get("status") != previous or finalized):
         save_state(p["state"], state)
     return state
 
@@ -154,6 +269,137 @@ def assistant_text(event: dict) -> str | None:
     return text or None
 
 
+def count_event_lines(path: Path) -> int:
+    try:
+        with path.open("rb") as handle:
+            return sum(1 for _line in handle)
+    except FileNotFoundError:
+        return 0
+
+
+def open_run(state: dict, p: dict[str, Path], prompt: str, request_id: str) -> None:
+    if state.get("openRun"):
+        raise RuntimeError("cannot open a second run while one is active")
+    sequence = int(state.get("runSequence", 0)) + 1
+    run_id = f"run-{sequence:06d}"
+    before = git_snapshot(p["cwd"])
+    run_dir = p["runs"] / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    write_private_text(run_dir / "brief.md", prompt.rstrip() + "\n")
+    if before and before.get("porcelain"):
+        print(
+            f"warning: worker '{state['slug']}' started with a dirty Git tree; change attribution will be ambiguous",
+            file=sys.stderr,
+            flush=True,
+        )
+    state["runSequence"] = sequence
+    state["openRun"] = {
+        "runId": run_id,
+        "openedAt": utc_now(),
+        "openedAtEpoch": time.time(),
+        "settleTarget": int(state.get("settleGeneration", 0)) + 1,
+        "initialRequestId": request_id,
+        "eventStartLine": int(state.get("eventLineCount", 0)) + 1,
+        "queuedFollowUps": 0,
+        "steers": 0,
+        "abortRequested": False,
+        "finalMessage": "",
+        "usage": {},
+        "stopReason": None,
+        "actualProvider": None,
+        "actualModel": None,
+        "gitBefore": before,
+        "rpcErrors": [],
+    }
+    state["expectedSettleGeneration"] = state["openRun"]["settleTarget"]
+    state["settledResultFresh"] = False
+
+
+def changed_paths(before: dict | None, after: dict | None) -> list[str] | None:
+    if before is None or after is None:
+        return None
+    before_lines = {porcelain_path(line): line[:2] for line in before.get("porcelain", [])}
+    after_lines = {porcelain_path(line): line[:2] for line in after.get("porcelain", [])}
+    return sorted(
+        path for path in set(before_lines) | set(after_lines)
+        if before_lines.get(path) != after_lines.get(path)
+    )
+
+
+def finalize_run(
+    state: dict,
+    p: dict[str, Path],
+    status: str,
+    *,
+    error: str | None = None,
+    abort_origin: str | None = None,
+    worker_alive: bool = True,
+    exit_code: int | None = None,
+    signal_name: str | None = None,
+) -> dict | None:
+    run = state.get("openRun")
+    if not isinstance(run, dict):
+        return None
+    after = git_snapshot(p["cwd"])
+    before = run.get("gitBefore")
+    before_paths = set((before or {}).get("paths", []))
+    after_paths = set((after or {}).get("paths", []))
+    before_staged = set((before or {}).get("staged", []))
+    after_staged = set((after or {}).get("staged", []))
+    finished_at = utc_now()
+    result = {
+        "schema": RESULT_SCHEMA,
+        "slug": state.get("slug"),
+        "runId": run["runId"],
+        "status": status,
+        "abortOrigin": abort_origin,
+        "workerAlive": worker_alive,
+        "startedAt": run.get("openedAt"),
+        "finishedAt": finished_at,
+        "durationMs": max(0, int((time.time() - float(run.get("openedAtEpoch", time.time()))) * 1000)),
+        "sessionFile": state.get("sessionFile"),
+        "sessionId": state.get("sessionId"),
+        "requestedModel": state.get("requestedModel"),
+        "actualProvider": run.get("actualProvider"),
+        "actualModel": run.get("actualModel"),
+        "usage": run.get("usage") or None,
+        "stopReason": run.get("stopReason"),
+        "finalMessage": run.get("finalMessage") or "",
+        "queuedFollowUps": run.get("queuedFollowUps", 0),
+        "steers": run.get("steers", 0),
+        "gitBefore": before,
+        "gitAfter": after,
+        "touchedFiles": changed_paths(before, after),
+        "gitEvidence": {
+            "attribution": "unavailable" if before is None or after is None else "ambiguous" if before.get("porcelain") else "clean-baseline",
+            "headMoved": bool(before and after and before.get("head") != after.get("head")),
+            "stashChanged": bool(before and after and before.get("stash") != after.get("stash")),
+            "stagedChangesAppeared": sorted(after_staged - before_staged),
+            "dirtyPathsVanished": sorted(before_paths - after_paths),
+        },
+        "eventStartLine": run.get("eventStartLine"),
+        "eventEndLine": state.get("eventLineCount"),
+        "eventsPath": state.get("eventsFile"),
+        "stderrPath": str(p["stderr"]),
+        "stderrTail": stderr_tail(p["stderr"]),
+        "rpcErrors": run.get("rpcErrors", []),
+        "exitCode": exit_code,
+        "signal": signal_name,
+        "error": error,
+    }
+    result_path = p["runs"] / run["runId"] / "result.json"
+    atomic_write_json(result_path, result)
+    state["lastRunId"] = run["runId"]
+    state["lastRunStatus"] = status
+    state["lastResultPath"] = str(result_path)
+    state["lastError"] = error
+    state["settledResultFresh"] = status == "completed" and bool(result["finalMessage"])
+    if status != "completed":
+        state["expectedSettleGeneration"] = state.get("settleGeneration", 0)
+    state["openRun"] = None
+    return result
+
+
 def write_rpc(child: subprocess.Popen, command: dict) -> None:
     if child.stdin is None:
         raise RuntimeError("Pi stdin is unavailable")
@@ -164,6 +410,7 @@ def write_rpc(child: subprocess.Popen, command: dict) -> None:
 def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: str) -> bool:
     events.write(line + "\n")
     events.flush()
+    state["eventLineCount"] = int(state.get("eventLineCount", 0)) + 1
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
@@ -172,6 +419,10 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
     force_save = False
     event_type = event.get("type")
     state["lastEvent"] = event_type
+    run = state.get("openRun")
+    if event_type == "session":
+        state["sessionId"] = event.get("sessionId") or event.get("id") or state.get("sessionId")
+        force_save = True
     if event_type == "agent_start":
         state["status"] = "running"
         force_save = True
@@ -185,9 +436,19 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
         state["settleGeneration"] += 1
         state["status"] = "idle"
         state["queuedFollowUps"] = 0
-        state["settledResultFresh"] = bool(state["resultFresh"])
-        if not state["settledResultFresh"]:
-            state["lastError"] = "worker settled without a fresh assistant result"
+        if isinstance(run, dict) and state["settleGeneration"] >= int(run.get("settleTarget", 0)):
+            final_status = "aborted" if run.get("abortRequested") else "completed"
+            final_error = None
+            if final_status == "completed" and not run.get("finalMessage"):
+                final_status = "failed"
+                final_error = "worker settled without a fresh assistant result"
+            finalize_run(
+                state,
+                p,
+                final_status,
+                error=final_error,
+                abort_origin="rpc" if run.get("abortRequested") else None,
+            )
         force_save = True
         print(f"worker '{slug}' settled", flush=True)
     elif event_type == "extension_ui_request":
@@ -198,8 +459,18 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
     elif event_type == "response":
         state["lastRpcResponseId"] = event.get("id")
         state["lastRpcSuccess"] = bool(event.get("success"))
+        data = event.get("data")
+        if isinstance(data, dict):
+            state["sessionId"] = data.get("sessionId") or state.get("sessionId")
         if not event.get("success", False):
             state["lastError"] = event.get("error") or "RPC command rejected"
+            if isinstance(run, dict):
+                run.setdefault("rpcErrors", []).append(
+                    {"requestId": event.get("id"), "error": state["lastError"]}
+                )
+                if event.get("id") == run.get("initialRequestId"):
+                    finalize_run(state, p, "failed", error=state["lastError"])
+                    state["status"] = "idle"
         force_save = True
 
     text = assistant_text(event)
@@ -207,12 +478,23 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
         p["result"].write_text(text + "\n", encoding="utf-8")
         state["resultFresh"] = True
         state["lastResultTurn"] = state["turnSequence"]
+        run = state.get("openRun")
+        if isinstance(run, dict):
+            message = event.get("message") or {}
+            run["finalMessage"] = text
+            run["actualProvider"] = message.get("provider") or event.get("provider") or run.get("actualProvider")
+            run["actualModel"] = message.get("model") or event.get("model") or run.get("actualModel")
+            run["stopReason"] = message.get("stopReason") or event.get("stopReason") or run.get("stopReason")
+            usage = message.get("usage") or event.get("usage")
+            if isinstance(usage, dict):
+                merge_numeric(run.setdefault("usage", {}), usage)
         force_save = True
     return force_save
 
 
 def prepare_runtime(p: dict[str, Path]) -> None:
     p["runtime"].mkdir(parents=True, exist_ok=True)
+    p["runs"].mkdir(parents=True, exist_ok=True)
     old = effective_state(p)
     if pid_alive(old.get("pid")):
         die(f"worker is already live with supervisor pid {old['pid']}")
@@ -224,15 +506,20 @@ def prepare_runtime(p: dict[str, Path]) -> None:
 
 
 def read_prompt(args: argparse.Namespace) -> str:
+    sources = int(bool(args.prompt)) + int(bool(args.prompt_file)) + int(bool(args.prompt_stdin))
+    if sources > 1:
+        die("use only one prompt source: positional prompt, --prompt-file, or --prompt-stdin")
     if args.prompt_file:
         try:
             prompt = Path(args.prompt_file).expanduser().read_text(encoding="utf-8")
         except OSError as error:
             die(f"cannot read prompt file: {error}")
+    elif args.prompt_stdin:
+        prompt = sys.stdin.read()
     else:
         prompt = args.prompt or ""
     if not prompt.strip():
-        die("provide a non-empty prompt or --prompt-file")
+        die("provide a non-empty prompt, --prompt-file, or --prompt-stdin")
     return prompt
 
 
@@ -252,6 +539,14 @@ def terminate_group(child: subprocess.Popen, pgid: int, timeout: float = 5) -> N
             child.wait()
     if group_alive(pgid):
         os.killpg(pgid, signal.SIGTERM)
+        deadline = time.monotonic() + PROCESS_GRACE_SECONDS
+        while group_alive(pgid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if group_alive(pgid):
+            os.killpg(pgid, signal.SIGKILL)
+            deadline = time.monotonic() + PROCESS_GRACE_SECONDS
+            while group_alive(pgid) and time.monotonic() < deadline:
+                time.sleep(0.05)
 
 
 def serve(args: argparse.Namespace) -> int:
@@ -271,13 +566,24 @@ def serve(args: argparse.Namespace) -> int:
     selector = None
     state: dict = {}
     stop_requested = False
+    stop_signal: int | None = None
 
-    def request_stop(_signum=None, _frame=None) -> None:
-        nonlocal stop_requested
+    def request_stop(signum=None, _frame=None) -> None:
+        nonlocal stop_requested, stop_signal
         stop_requested = True
+        stop_signal = signum
 
     try:
         prepare_runtime(p)
+        previous_state = load_state(p["state"])
+        existing_sequences = [
+            int(path.name[4:])
+            for path in p["runs"].glob("run-[0-9][0-9][0-9][0-9][0-9][0-9]")
+            if path.name[4:].isdigit()
+        ]
+        previous_run_sequence = max(
+            [int(previous_state.get("runSequence", 0))] + existing_sequences
+        )
         command = [pi, "--mode", "rpc", "--session", str(p["session"]), "-a", "--name", slug]
         if args.model:
             command.extend(["--model", args.model])
@@ -306,8 +612,13 @@ def serve(args: argparse.Namespace) -> int:
             "status": "starting",
             "sessionFile": str(p["session"]),
             "eventsFile": str(p["events"]),
-            "settleGeneration": 0,
-            "expectedSettleGeneration": 1,
+            "settleGeneration": int(previous_state.get("settleGeneration", 0)),
+            "expectedSettleGeneration": int(previous_state.get("settleGeneration", 0)) + 1,
+            "runSequence": previous_run_sequence,
+            "openRun": None,
+            "lastRunId": previous_state.get("lastRunId"),
+            "lastRunStatus": previous_state.get("lastRunStatus"),
+            "lastResultPath": previous_state.get("lastResultPath"),
             "queuedFollowUps": 0,
             "turnSequence": 0,
             "resultFresh": False,
@@ -318,11 +629,15 @@ def serve(args: argparse.Namespace) -> int:
             "lastControlRequestId": None,
             "lastRpcResponseId": None,
             "lastRpcSuccess": None,
+            "eventLineCount": count_event_lines(p["events"]),
+            "sessionId": previous_state.get("sessionId"),
+            "requestedModel": args.model,
         }
         p["pid"].write_text(f"{os.getpid()}\n", encoding="utf-8")
         save_state(p["state"], state)
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGHUP, request_stop)
 
         fifo_fd = os.open(p["fifo"], os.O_RDWR | os.O_NONBLOCK)
         fifo_buffer = ""
@@ -334,6 +649,8 @@ def serve(args: argparse.Namespace) -> int:
         selector.register(fifo_fd, selectors.EVENT_READ, "control")
 
         initial_id = f"initial-{uuid.uuid4().hex}"
+        open_run(state, p, prompt, initial_id)
+        save_state(p["state"], state)
         write_rpc(child, {"id": initial_id, "type": "prompt", "message": prompt})
         print(f"worker '{slug}' started; session {p['session']}", flush=True)
         last_state_flush = time.monotonic()
@@ -344,6 +661,14 @@ def serve(args: argparse.Namespace) -> int:
                 if child.poll() is not None:
                     state["status"] = "dead"
                     state["lastError"] = f"Pi exited with code {child.returncode}"
+                    finalize_run(
+                        state,
+                        p,
+                        "failed",
+                        error=state["lastError"],
+                        worker_alive=False,
+                        exit_code=child.returncode,
+                    )
                     save_state(p["state"], state)
                     return 2
 
@@ -394,12 +719,24 @@ def serve(args: argparse.Namespace) -> int:
                                 continue
                             rpc["id"] = request_id
                             rpc_type = rpc.get("type")
-                            if rpc_type in {"prompt", "follow_up"}:
+                            if rpc_type == "prompt":
+                                if state.get("openRun"):
+                                    state["lastError"] = "cannot start a new run while the current run is active"
+                                    state["lastControlRequestId"] = request_id
+                                    force_save = True
+                                    continue
+                                open_run(state, p, str(rpc.get("message") or ""), request_id)
                                 state["status"] = "queued"
-                                state["expectedSettleGeneration"] = state["settleGeneration"] + 1
                                 state["settledResultFresh"] = False
-                                if rpc_type == "follow_up":
-                                    state["queuedFollowUps"] += 1
+                            elif rpc_type == "follow_up":
+                                state["status"] = "queued"
+                                state["queuedFollowUps"] += 1
+                                if isinstance(state.get("openRun"), dict):
+                                    state["openRun"]["queuedFollowUps"] += 1
+                            elif rpc_type == "steer" and isinstance(state.get("openRun"), dict):
+                                state["openRun"]["steers"] += 1
+                            elif rpc_type == "abort" and isinstance(state.get("openRun"), dict):
+                                state["openRun"]["abortRequested"] = True
                             write_rpc(child, rpc)
                             state["lastControlRequestId"] = request_id
                             force_save = True
@@ -418,6 +755,7 @@ def serve(args: argparse.Namespace) -> int:
         if state:
             state["status"] = "dead"
             state["lastError"] = str(error)
+            finalize_run(state, p, "failed", error=str(error), worker_alive=False)
             save_state(p["state"], state)
         raise
     finally:
@@ -430,6 +768,22 @@ def serve(args: argparse.Namespace) -> int:
         if stderr_handle:
             stderr_handle.close()
         if state:
+            if state.get("openRun"):
+                signal_name = None
+                if stop_signal is not None:
+                    try:
+                        signal_name = signal.Signals(stop_signal).name
+                    except ValueError:
+                        signal_name = str(stop_signal)
+                finalize_run(
+                    state,
+                    p,
+                    "aborted",
+                    error="supervisor stopped before the run settled",
+                    abort_origin="signal" if stop_signal is not None else "supervisor",
+                    worker_alive=False,
+                    signal_name=signal_name,
+                )
             state["status"] = "stopped" if stop_requested else state.get("status", "dead")
             state["pid"] = None
             state["piPid"] = None
@@ -520,6 +874,12 @@ def wait_worker(args: argparse.Namespace) -> int:
     while time.monotonic() < deadline:
         state = require_state(p)
         if state.get("status") == "idle" and int(state.get("settleGeneration", 0)) >= target:
+            if state.get("lastRunStatus") not in {None, "completed"}:
+                print(
+                    f"worker '{args.slug}' ended run {state.get('lastRunId')} with status {state.get('lastRunStatus')}",
+                    file=sys.stderr,
+                )
+                return 2
             print(f"worker '{args.slug}' settled")
             return 0
         if state.get("status") in {"dead", "orphaned", "stopped"}:
@@ -533,14 +893,21 @@ def wait_worker(args: argparse.Namespace) -> int:
 def result(args: argparse.Namespace) -> int:
     p = worker_paths(args)
     state = require_state(p)
-    if state.get("status") != "idle":
-        die(f"worker is {state.get('status')}; no settled result is available")
-    if not state.get("settledResultFresh"):
-        die(state.get("lastError") or "worker settled without a fresh assistant result")
+    result_path = state.get("lastResultPath")
+    if not result_path:
+        die("worker has no completed run artifact")
     try:
-        print(p["result"].read_text(encoding="utf-8").rstrip())
+        run_result = json.loads(Path(result_path).read_text(encoding="utf-8"))
     except FileNotFoundError:
-        die("state reports a fresh result, but result.md is missing")
+        die(f"state points to a missing run artifact: {result_path}")
+    except json.JSONDecodeError as error:
+        die(f"run artifact is invalid JSON: {error}")
+    if args.json:
+        print(json.dumps(run_result, ensure_ascii=False, indent=2))
+    elif run_result.get("finalMessage"):
+        print(str(run_result["finalMessage"]).rstrip())
+    else:
+        die(run_result.get("error") or f"run ended with status {run_result.get('status')}")
     return 0
 
 
@@ -644,7 +1011,7 @@ def clean(args: argparse.Namespace) -> int:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:6]}"
         archive = p["logs"] / stamp
         archive.mkdir(parents=True, exist_ok=False)
-        for name in ("events.jsonl", "stderr.log", "result.md", "state.json"):
+        for name in ("events.jsonl", "stderr.log", "result.md", "state.json", "runs"):
             source = p["runtime"] / name
             if source.exists():
                 shutil.move(str(source), archive / name)
@@ -667,6 +1034,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument("slug")
     serve_p.add_argument("prompt", nargs="?")
     serve_p.add_argument("--prompt-file")
+    serve_p.add_argument("--prompt-stdin", action="store_true")
     add_cwd(serve_p)
     serve_p.add_argument("--model")
     serve_p.add_argument("--thinking", choices=["off", "minimal", "low", "medium", "high", "xhigh", "max"])
@@ -681,6 +1049,8 @@ def build_parser() -> argparse.ArgumentParser:
         item = sub.add_parser(name)
         item.add_argument("slug")
         add_cwd(item)
+        if name == "result":
+            item.add_argument("--json", action="store_true", help="print the full result artifact")
         item.set_defaults(func=globals()[name])
 
     wait_p = sub.add_parser("wait")

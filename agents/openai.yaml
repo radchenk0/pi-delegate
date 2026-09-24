@@ -1,4 +1,4 @@
 interface:
-  display_name: "Pi RPC Worker"
+  display_name: "Pi Delegate"
   short_description: "Delegate work to resumable Pi RPC agents"
-  default_prompt: "Use $pi-rpc-worker to delegate this task to a resumable Pi RPC worker."
+  default_prompt: "Use $pi-delegate to delegate this task to a resumable Pi RPC worker."

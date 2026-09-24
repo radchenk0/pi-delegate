@@ -104,7 +104,9 @@ this checkout with supported skill-directory symlinks.
 2. Validate `SKILL.md` frontmatter and supporting-resource links.
 3. Run a live Pi smoke operation in an isolated temporary Git repository.
 4. Ask an independent Pi session to review the diff read-only.
-5. Install the checkout through symlinks for Codex and Claude Code.
-6. Remove the legacy `~/.codex/skills/pi-rpc-worker` copy only after both new
-   installations resolve to this checkout and the current project guidance has
+5. Install the checkout through a symlink for Codex. Exercise the optional
+   Claude Code target with a temporary home without installing it for the
+   current user.
+6. Remove the legacy `~/.codex/skills/pi-rpc-worker` copy only after the Codex
+   installation resolves to this checkout and current project guidance has
    been updated to `$pi-delegate`.
