@@ -306,6 +306,25 @@ class WorkerControlTest(WorkerTestCase):
         self.assertEqual(self.run_result(settled)["finalMessage"], "done: ui selected")
         self.stop("sel")
 
+    def test_wait_return_on_ui_surfaces_a_blocking_dialog(self):
+        self.start("wui", "SELECT")
+        self.wait_state("wui", lambda s: isinstance(s.get("pendingUi"), dict), timeout=10)
+
+        # Without the flag a blocked worker just runs out the clock.
+        plain = self.command("wait", "wui", "0.5", check=False)
+        self.assertEqual(plain.returncode, 1)
+
+        blocked = self.command("wait", "wui", "5", "--return-on-ui", check=False)
+        self.assertEqual(blocked.returncode, 3)
+        self.assertIn("waiting on a select dialog (ui-2)", blocked.stdout)
+        self.assertIn("title: dangerous operation requires confirmation: git commit", blocked.stdout)
+        self.assertIn("option: y: allow once", blocked.stdout)
+
+        self.command("ui-respond", "wui", "--value", "y: allow once")
+        settled = self.command("wait", "wui", "10", "--return-on-ui")
+        self.assertIn("settled", settled.stdout)
+        self.stop("wui")
+
     def test_git_snapshot_degradation_is_surfaced_in_result(self):
         real_git = shutil.which("git")
         self.assertTrue(real_git)

@@ -35,6 +35,12 @@ python3 /absolute/path/to/pi-delegate/scripts/pi_rpc_worker.py result task-name 
 `list` shows every worker slug under the project with its live status, PIDs,
 and last event; `status` shows one worker's full state JSON.
 
+`wait` exits 0 when the run settles, 1 on timeout, and 2 when the run fails
+or the worker dies. Add `--return-on-ui` to also exit 3 as soon as the
+worker is blocked on an extension dialog; it prints the dialog's title and
+options so you can answer with `ui-respond` (below) and wait again. Without
+it, a dialog silently consumes the whole wait window.
+
 ### Live view
 
 Use `watch` for a read-only, human-readable live stream of assistant text,

@@ -1007,6 +1007,15 @@ def wait_worker(args: argparse.Namespace) -> int:
         if state.get("status") in {"dead", "orphaned", "stopped"}:
             print(f"worker '{args.slug}' is {state['status']}", file=sys.stderr)
             return 2
+        pending = state.get("pendingUi")
+        if args.return_on_ui and isinstance(pending, dict):
+            print(f"worker '{args.slug}' is waiting on a {pending.get('method')} dialog ({pending.get('id')})")
+            for field in ("title", "message"):
+                if pending.get(field):
+                    print(f"{field}: {pending[field]}")
+            for option in pending.get("options") or []:
+                print(f"option: {option}")
+            return 3
         time.sleep(0.25)
     print(f"timed out after {args.timeout:g}s", file=sys.stderr)
     return 1
@@ -1450,9 +1459,17 @@ def build_parser() -> argparse.ArgumentParser:
             item.add_argument("--json", action="store_true", help="print the full result artifact")
         item.set_defaults(func=globals()[name])
 
-    wait_p = sub.add_parser("wait")
+    wait_p = sub.add_parser(
+        "wait",
+        help="block until the open run settles (exit 0), times out (1), or fails (2)",
+    )
     wait_p.add_argument("slug")
     wait_p.add_argument("timeout", nargs="?", type=float, default=600)
+    wait_p.add_argument(
+        "--return-on-ui",
+        action="store_true",
+        help="exit 3 and print the dialog when the worker is blocked on an extension dialog",
+    )
     add_cwd(wait_p)
     wait_p.set_defaults(func=wait_worker)
 
