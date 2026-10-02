@@ -28,7 +28,9 @@ supervisor PID; `state.json` is authoritative for liveness.
 
 Useful `state.json` fields beyond liveness: `openRun` (the active run and its
 queued follow-ups/steers), `lastRunId`/`lastRunStatus`, `pendingUi` (a blocking
-extension dialog awaiting `ui-respond`; `null` when none),
+extension dialog awaiting `ui-respond`: its `id`, `method`, and whichever of
+`title`, `message`, `options`, `placeholder`, and `timeout` Pi sent, text
+capped at 4000 characters; `null` when none),
 `lastControlRequestId`/`lastRpcResponseId` (control-plane correlation), and
 `lastError`. State imported from the legacy helper has no `lastRunId`; the
 `result` command then falls back to the cached `result.md` when the state was

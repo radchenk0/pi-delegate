@@ -241,6 +241,11 @@ class WorkerControlTest(WorkerTestCase):
             timeout=10,
         )
         self.assertEqual(state["pendingUi"]["method"], "confirm")
+        # The dialog text is recorded so an orchestrator can decide without
+        # reading events.jsonl.
+        self.assertEqual(state["pendingUi"]["title"], "Proceed with fake step?")
+        self.assertEqual(state["pendingUi"]["message"], "Nothing real happens.")
+        self.assertNotIn("options", state["pendingUi"])
 
         # Invalid forms are refused by the CLI.
         no_flag = self.command("ui-respond", "uiw", check=False)

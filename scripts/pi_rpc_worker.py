@@ -32,6 +32,10 @@ RESULT_SCHEMA = "pi-delegate.result.v1"
 # until an extension_ui_response arrives; the rest are fire-and-forget.
 UI_DIALOG_METHODS = {"select", "confirm", "input", "editor"}
 UI_FIRE_AND_FORGET_METHODS = {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"}
+# Dialog fields an orchestrator needs to answer without reading events.jsonl;
+# long titles (e.g. a whole shell command) are capped to keep state.json small.
+UI_DIALOG_FIELDS = ("title", "message", "options", "placeholder", "timeout")
+UI_TEXT_LIMIT = 4000
 
 
 def die(message: str, code: int = 2) -> NoReturn:
@@ -61,6 +65,19 @@ def paths(cwd: Path, slug: str) -> dict[str, Path]:
         "fifo": runtime / "control.fifo",
         "pid": runtime / "supervisor.pid",
     }
+
+
+def pending_ui_record(event: dict, request_id: str, method: str) -> dict:
+    record = {"id": request_id, "method": method}
+    for field in UI_DIALOG_FIELDS:
+        value = event.get(field)
+        if isinstance(value, str):
+            record[field] = value[:UI_TEXT_LIMIT]
+        elif field == "options" and isinstance(value, list):
+            record[field] = [str(option)[:UI_TEXT_LIMIT] for option in value]
+        elif field == "timeout" and isinstance(value, (int, float)) and not isinstance(value, bool):
+            record[field] = value
+    return record
 
 
 def load_state(path: Path) -> dict:
@@ -497,7 +514,7 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
             if not isinstance(request_id, str) or not request_id:
                 state["lastError"] = f"blocking extension UI request has no valid id: {method}"
             else:
-                state["pendingUi"] = {"id": request_id, "method": method}
+                state["pendingUi"] = pending_ui_record(event, request_id, method)
             force_save = True
         elif method not in UI_FIRE_AND_FORGET_METHODS:
             state["lastError"] = f"unrecognized extension UI request: {method}"

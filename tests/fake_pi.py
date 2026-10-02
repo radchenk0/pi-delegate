@@ -84,7 +84,13 @@ for raw in sys.stdin.buffer:
             # One fire-and-forget notification (must not block or error) and one
             # blocking confirm dialog that waits for extension_ui_response.
             emit({"type": "extension_ui_request", "id": "ff-1", "method": "notify"})
-            emit({"type": "extension_ui_request", "id": "ui-1", "method": "confirm"})
+            emit({
+                "type": "extension_ui_request",
+                "id": "ui-1",
+                "method": "confirm",
+                "title": "Proceed with fake step?",
+                "message": "Nothing real happens.",
+            })
             continue
         emit({"type": "turn_start"})
         if "STREAM" in message:

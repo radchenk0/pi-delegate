@@ -76,8 +76,9 @@ stacking another until its acknowledgement and eventual settle are visible.
 
 If a worker appears stuck, inspect `status`, `stderr.log`, and the tail of
 `events.jsonl`. A blocking extension dialog shows up in `status` as
-`pendingUi` (methods `select`, `confirm`, `input`, `editor`); the worker
-stays alive but waits for an answer. Fire-and-forget UI requests
+`pendingUi` (methods `select`, `confirm`, `input`, `editor`) with the
+dialog's `title`, `message`, and `options`; the worker stays alive but waits
+for an answer. Fire-and-forget UI requests
 (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) never
 block and need no answer. Answer a pending dialog explicitly:
 
