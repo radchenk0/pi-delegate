@@ -282,6 +282,30 @@ class WorkerControlTest(WorkerTestCase):
         self.assertIn("no pending blocking UI request", empty.stderr)
         self.stop("uiw")
 
+    def test_ui_respond_select_requires_an_offered_option(self):
+        self.start("sel", "SELECT")
+        state = self.wait_state(
+            "sel",
+            lambda s: isinstance(s.get("pendingUi"), dict) and s["pendingUi"].get("id") == "ui-2",
+            timeout=10,
+        )
+        self.assertEqual(state["pendingUi"]["options"], ["y: allow once", "s: allow session", "n: deny"])
+
+        # A shorthand or paraphrase is refused locally and lists the options,
+        # instead of being sent to Pi and leaving the dialog unanswered.
+        wrong = self.command("ui-respond", "sel", "--value", "y", check=False)
+        self.assertEqual(wrong.returncode, 2)
+        self.assertIn("must be one of the offered options", wrong.stderr)
+        self.assertIn("'y: allow once'", wrong.stderr)
+        self.assertEqual(self.wait_state("sel", lambda s: True)["pendingUi"]["id"], "ui-2")
+
+        self.command("ui-respond", "sel", "--value", "y: allow once")
+        settled = self.wait_state(
+            "sel", lambda s: s.get("status") == "idle" and s.get("pendingUi") is None, timeout=10,
+        )
+        self.assertEqual(self.run_result(settled)["finalMessage"], "done: ui selected")
+        self.stop("sel")
+
     def test_git_snapshot_degradation_is_surfaced_in_result(self):
         real_git = shutil.which("git")
         self.assertTrue(real_git)

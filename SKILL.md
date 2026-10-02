@@ -93,6 +93,13 @@ Use `--confirmed` for `confirm` dialogs, `--value ANSWER` for
 Exactly one form is accepted per call; the pending id is taken from state,
 so the response always matches the open dialog.
 
+For a `select`, the value must be one of the offered `options` verbatim
+(for example `--value "y: allow once"`, not `--value y`); other values are
+refused before reaching Pi. When a permission extension offers a
+session-wide approval, prefer the one-time option: a session approval
+covers the whole program (for example every `git` command) for the rest of
+the worker's life, not just the command shown.
+
 ## Verify and finish
 
 Treat the final message and gate claims as evidence to check. Inspect the run

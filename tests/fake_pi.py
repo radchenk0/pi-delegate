@@ -53,6 +53,20 @@ for raw in sys.stdin.buffer:
                 },
             })
             emit({"type": "agent_settled"})
+        if command.get("id") == "ui-2" and command.get("value") == "y: allow once":
+            emit({"type": "turn_start"})
+            emit({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "done: ui selected"}],
+                    "provider": "fake-provider",
+                    "model": "fake-model",
+                    "usage": {"input": 3, "output": 2},
+                    "stopReason": "stop",
+                },
+            })
+            emit({"type": "agent_settled"})
         continue
     if kind in {"prompt", "follow_up", "steer", "abort"}:
         if "REJECT" in message:
@@ -79,6 +93,17 @@ for raw in sys.stdin.buffer:
             time.sleep(30)
             continue
         if "HOLD" in message:
+            continue
+        if "SELECT" in message:
+            # A permission-style select dialog: the answer must be one of
+            # the option strings verbatim.
+            emit({
+                "type": "extension_ui_request",
+                "id": "ui-2",
+                "method": "select",
+                "title": "dangerous operation requires confirmation: git commit",
+                "options": ["y: allow once", "s: allow session", "n: deny"],
+            })
             continue
         if "UI" in message:
             # One fire-and-forget notification (must not block or error) and one

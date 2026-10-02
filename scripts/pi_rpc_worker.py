@@ -1092,6 +1092,11 @@ def ui_respond(args: argparse.Namespace) -> int:
         die("confirm dialogs require --confirmed or --cancelled")
     if method != "confirm" and args.confirmed:
         die(f"{method} dialogs require --value or --cancelled")
+    # Pi expects a select answer to be one of the offered option strings
+    # verbatim; anything else would leave the dialog unanswered or misread.
+    options = pending.get("options")
+    if method == "select" and args.value is not None and isinstance(options, list) and args.value not in options:
+        die("select value must be one of the offered options: " + ", ".join(repr(option) for option in options))
     if args.value is not None:
         fields = {"value": args.value}
     elif args.confirmed:
