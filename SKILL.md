@@ -152,3 +152,5 @@ out of version control unless the project explicitly tracks agent state.
 Read [result-schema.md](references/result-schema.md) for state and result
 fields, [rpc-protocol.md](references/rpc-protocol.md) for protocol details, and
 [claude-code.md](references/claude-code.md) for running workers from Claude Code.
+To use Pi as the implementer in superpowers' subagent-driven development,
+read [superpowers-sdd.md](references/superpowers-sdd.md).

@@ -72,4 +72,6 @@ that every project ignores it without editing tracked files.
 ## Native subagents
 
 Claude Code's `Agent` tool and pi workers are different mechanisms. Use this
-skill when the work should run on Pi's models and tools.
+skill when the work should run on Pi's models and tools. For running Pi as
+the implementer inside superpowers' subagent-driven development, see
+[superpowers-sdd.md](superpowers-sdd.md).
