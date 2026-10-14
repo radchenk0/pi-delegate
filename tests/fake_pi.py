@@ -53,6 +53,23 @@ for raw in sys.stdin.buffer:
                 },
             })
             emit({"type": "agent_settled"})
+        if (command.get("id"), command.get("value")) in {
+            ("ui-2", "y: allow once"),
+            ("ui-3", "allow " + "д" * 5000 + " END"),
+        }:
+            emit({"type": "turn_start"})
+            emit({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "done: ui selected"}],
+                    "provider": "fake-provider",
+                    "model": "fake-model",
+                    "usage": {"input": 3, "output": 2},
+                    "stopReason": "stop",
+                },
+            })
+            emit({"type": "agent_settled"})
         continue
     if kind in {"prompt", "follow_up", "steer", "abort"}:
         if "REJECT" in message:
@@ -80,11 +97,39 @@ for raw in sys.stdin.buffer:
             continue
         if "HOLD" in message:
             continue
+        if "LONG_SELECT" in message:
+            emit({
+                "type": "extension_ui_request",
+                "id": "ui-3",
+                "method": "select",
+                "title": "title " + "т" * 5000 + " END",
+                "message": "message " + "м" * 5000 + " END",
+                "placeholder": "placeholder " + "п" * 5000 + " END",
+                "options": ["allow " + "д" * 5000 + " END", "deny"],
+            })
+            continue
+        if "SELECT" in message:
+            # A permission-style select dialog: the answer must be one of
+            # the option strings verbatim.
+            emit({
+                "type": "extension_ui_request",
+                "id": "ui-2",
+                "method": "select",
+                "title": "dangerous operation requires confirmation: git commit",
+                "options": ["y: allow once", "s: allow session", "n: deny"],
+            })
+            continue
         if "UI" in message:
             # One fire-and-forget notification (must not block or error) and one
             # blocking confirm dialog that waits for extension_ui_response.
             emit({"type": "extension_ui_request", "id": "ff-1", "method": "notify"})
-            emit({"type": "extension_ui_request", "id": "ui-1", "method": "confirm"})
+            emit({
+                "type": "extension_ui_request",
+                "id": "ui-1",
+                "method": "confirm",
+                "title": "Proceed with fake step?",
+                "message": "Nothing real happens.",
+            })
             continue
         emit({"type": "turn_start"})
         if "STREAM" in message:

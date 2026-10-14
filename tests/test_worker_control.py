@@ -241,6 +241,11 @@ class WorkerControlTest(WorkerTestCase):
             timeout=10,
         )
         self.assertEqual(state["pendingUi"]["method"], "confirm")
+        # The dialog text is recorded so an orchestrator can decide without
+        # reading events.jsonl.
+        self.assertEqual(state["pendingUi"]["title"], "Proceed with fake step?")
+        self.assertEqual(state["pendingUi"]["message"], "Nothing real happens.")
+        self.assertNotIn("options", state["pendingUi"])
 
         # Invalid forms are refused by the CLI.
         no_flag = self.command("ui-respond", "uiw", check=False)
@@ -276,6 +281,76 @@ class WorkerControlTest(WorkerTestCase):
         self.assertEqual(empty.returncode, 2)
         self.assertIn("no pending blocking UI request", empty.stderr)
         self.stop("uiw")
+
+    def test_ui_respond_select_requires_an_offered_option(self):
+        self.start("sel", "SELECT")
+        state = self.wait_state(
+            "sel",
+            lambda s: isinstance(s.get("pendingUi"), dict) and s["pendingUi"].get("id") == "ui-2",
+            timeout=10,
+        )
+        self.assertEqual(state["pendingUi"]["options"], ["y: allow once", "s: allow session", "n: deny"])
+
+        # A shorthand or paraphrase is refused locally and lists the options,
+        # instead of being sent to Pi and leaving the dialog unanswered.
+        wrong = self.command("ui-respond", "sel", "--value", "y", check=False)
+        self.assertEqual(wrong.returncode, 2)
+        self.assertIn("must be one of the offered options", wrong.stderr)
+        self.assertIn("'y: allow once'", wrong.stderr)
+        self.assertEqual(self.wait_state("sel", lambda s: True)["pendingUi"]["id"], "ui-2")
+
+        self.command("ui-respond", "sel", "--value", "y: allow once")
+        settled = self.wait_state(
+            "sel", lambda s: s.get("status") == "idle" and s.get("pendingUi") is None, timeout=10,
+        )
+        self.assertEqual(self.run_result(settled)["finalMessage"], "done: ui selected")
+        self.stop("sel")
+
+    def test_long_dialog_text_and_select_answer_are_preserved(self):
+        self.start("longui", "LONG_SELECT")
+        state = self.wait_state(
+            "longui",
+            lambda s: isinstance(s.get("pendingUi"), dict) and s["pendingUi"].get("id") == "ui-3",
+            timeout=10,
+        )
+        pending = state["pendingUi"]
+        for field, character in (("title", "т"), ("message", "м"), ("placeholder", "п")):
+            self.assertEqual(pending[field], field + " " + character * 5000 + " END")
+        option = "allow " + "д" * 5000 + " END"
+        self.assertEqual(pending["options"], [option, "deny"])
+
+        blocked = self.command("wait", "longui", "5", "--return-on-ui", check=False)
+        self.assertEqual(blocked.returncode, 3)
+        self.assertIn("title: " + pending["title"], blocked.stdout)
+        self.assertIn("message: " + pending["message"], blocked.stdout)
+        self.assertIn("option: " + option, blocked.stdout)
+
+        self.command("ui-respond", "longui", "--value", option)
+        settled = self.wait_state(
+            "longui", lambda s: s.get("status") == "idle" and s.get("pendingUi") is None, timeout=10,
+        )
+        # The fake Pi settles only after receiving the complete option verbatim.
+        self.assertEqual(self.run_result(settled)["finalMessage"], "done: ui selected")
+        self.stop("longui")
+
+    def test_wait_return_on_ui_surfaces_a_blocking_dialog(self):
+        self.start("wui", "SELECT")
+        self.wait_state("wui", lambda s: isinstance(s.get("pendingUi"), dict), timeout=10)
+
+        # Without the flag a blocked worker just runs out the clock.
+        plain = self.command("wait", "wui", "0.5", check=False)
+        self.assertEqual(plain.returncode, 1)
+
+        blocked = self.command("wait", "wui", "5", "--return-on-ui", check=False)
+        self.assertEqual(blocked.returncode, 3)
+        self.assertIn("waiting on a select dialog (ui-2)", blocked.stdout)
+        self.assertIn("title: dangerous operation requires confirmation: git commit", blocked.stdout)
+        self.assertIn("option: y: allow once", blocked.stdout)
+
+        self.command("ui-respond", "wui", "--value", "y: allow once")
+        settled = self.command("wait", "wui", "10", "--return-on-ui")
+        self.assertIn("settled", settled.stdout)
+        self.stop("wui")
 
     def test_git_snapshot_degradation_is_surfaced_in_result(self):
         real_git = shutil.which("git")

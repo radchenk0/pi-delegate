@@ -25,7 +25,7 @@ Read this reference only when debugging, extending, or bypassing the bundled hel
 {"id":"ui-request-id","type":"extension_ui_response","cancelled":true}
 ```
 
-Correlate acceptance with the Pi `response` carrying the same `id`. A successful FIFO write confirms transport to the supervisor only. The `abort` acknowledgement arrives only after the agent has settled, so an ack implies the run is already closed. `extension_ui_response` has no acknowledgement of its own; the id must be the id from the matching `extension_ui_request`, and exactly one of `value`, `confirmed`, or `cancelled` is sent.
+Correlate acceptance with the Pi `response` carrying the same `id`. A successful FIFO write confirms transport to the supervisor only. The `abort` acknowledgement arrives only after the agent has settled, so an ack implies the run is already closed. `extension_ui_response` has no acknowledgement of its own; the id must be the id from the matching `extension_ui_request`, and exactly one of `value`, `confirmed`, or `cancelled` is sent. For `select`, `value` is the chosen option string exactly as offered in the request's `options`.
 
 When idle, send a new `prompt`. While streaming, `follow_up` queues later work. The default follow-up mode processes one queued message per completion; `agent_settled` is emitted only after retry, compaction, and queued continuations are exhausted. Do not equate one `agent_settled` with one queued message.
 

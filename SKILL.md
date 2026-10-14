@@ -35,6 +35,12 @@ python3 /absolute/path/to/pi-delegate/scripts/pi_rpc_worker.py result task-name 
 `list` shows every worker slug under the project with its live status, PIDs,
 and last event; `status` shows one worker's full state JSON.
 
+`wait` exits 0 when the run settles, 1 on timeout, and 2 when the run fails
+or the worker dies. Add `--return-on-ui` to also exit 3 as soon as the
+worker is blocked on an extension dialog; it prints the dialog's title and
+options so you can answer with `ui-respond` (below) and wait again. Without
+it, a dialog silently consumes the whole wait window.
+
 ### Live view
 
 Use `watch` for a read-only, human-readable live stream of assistant text,
@@ -76,8 +82,9 @@ stacking another until its acknowledgement and eventual settle are visible.
 
 If a worker appears stuck, inspect `status`, `stderr.log`, and the tail of
 `events.jsonl`. A blocking extension dialog shows up in `status` as
-`pendingUi` (methods `select`, `confirm`, `input`, `editor`); the worker
-stays alive but waits for an answer. Fire-and-forget UI requests
+`pendingUi` (methods `select`, `confirm`, `input`, `editor`) with the
+dialog's `title`, `message`, and `options`; the worker stays alive but waits
+for an answer. Fire-and-forget UI requests
 (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) never
 block and need no answer. Answer a pending dialog explicitly:
 
@@ -91,6 +98,13 @@ Use `--confirmed` for `confirm` dialogs, `--value ANSWER` for
 `select`/`input`/`editor` dialogs, and `--cancelled` to dismiss any dialog.
 Exactly one form is accepted per call; the pending id is taken from state,
 so the response always matches the open dialog.
+
+For a `select`, the value must be one of the offered `options` verbatim
+(for example `--value "y: allow once"`, not `--value y`); other values are
+refused before reaching Pi. When a permission extension offers a
+session-wide approval, prefer the one-time option: a session approval
+covers the whole program (for example every `git` command) for the rest of
+the worker's life, not just the command shown.
 
 ## Verify and finish
 
@@ -137,4 +151,6 @@ out of version control unless the project explicitly tracks agent state.
 
 Read [result-schema.md](references/result-schema.md) for state and result
 fields, [rpc-protocol.md](references/rpc-protocol.md) for protocol details, and
-[claude-code.md](references/claude-code.md) for Claude Code packaging notes.
+[claude-code.md](references/claude-code.md) for running workers from Claude Code.
+To use Pi as the implementer in superpowers' subagent-driven development,
+read [superpowers-sdd.md](references/superpowers-sdd.md).

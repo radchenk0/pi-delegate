@@ -32,6 +32,8 @@ RESULT_SCHEMA = "pi-delegate.result.v1"
 # until an extension_ui_response arrives; the rest are fire-and-forget.
 UI_DIALOG_METHODS = {"select", "confirm", "input", "editor"}
 UI_FIRE_AND_FORGET_METHODS = {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"}
+# Dialog fields an orchestrator needs to answer without reading events.jsonl.
+UI_DIALOG_FIELDS = ("title", "message", "options", "placeholder", "timeout")
 
 
 def die(message: str, code: int = 2) -> NoReturn:
@@ -61,6 +63,19 @@ def paths(cwd: Path, slug: str) -> dict[str, Path]:
         "fifo": runtime / "control.fifo",
         "pid": runtime / "supervisor.pid",
     }
+
+
+def pending_ui_record(event: dict, request_id: str, method: str) -> dict:
+    record = {"id": request_id, "method": method}
+    for field in UI_DIALOG_FIELDS:
+        value = event.get(field)
+        if isinstance(value, str):
+            record[field] = value
+        elif field == "options" and isinstance(value, list):
+            record[field] = [str(option) for option in value]
+        elif field == "timeout" and isinstance(value, (int, float)) and not isinstance(value, bool):
+            record[field] = value
+    return record
 
 
 def load_state(path: Path) -> dict:
@@ -497,7 +512,7 @@ def process_pi_event(line: str, events, state: dict, p: dict[str, Path], slug: s
             if not isinstance(request_id, str) or not request_id:
                 state["lastError"] = f"blocking extension UI request has no valid id: {method}"
             else:
-                state["pendingUi"] = {"id": request_id, "method": method}
+                state["pendingUi"] = pending_ui_record(event, request_id, method)
             force_save = True
         elif method not in UI_FIRE_AND_FORGET_METHODS:
             state["lastError"] = f"unrecognized extension UI request: {method}"
@@ -990,6 +1005,15 @@ def wait_worker(args: argparse.Namespace) -> int:
         if state.get("status") in {"dead", "orphaned", "stopped"}:
             print(f"worker '{args.slug}' is {state['status']}", file=sys.stderr)
             return 2
+        pending = state.get("pendingUi")
+        if args.return_on_ui and isinstance(pending, dict):
+            print(f"worker '{args.slug}' is waiting on a {pending.get('method')} dialog ({pending.get('id')})")
+            for field in ("title", "message"):
+                if pending.get(field):
+                    print(f"{field}: {pending[field]}")
+            for option in pending.get("options") or []:
+                print(f"option: {option}")
+            return 3
         time.sleep(0.25)
     print(f"timed out after {args.timeout:g}s", file=sys.stderr)
     return 1
@@ -1075,6 +1099,11 @@ def ui_respond(args: argparse.Namespace) -> int:
         die("confirm dialogs require --confirmed or --cancelled")
     if method != "confirm" and args.confirmed:
         die(f"{method} dialogs require --value or --cancelled")
+    # Pi expects a select answer to be one of the offered option strings
+    # verbatim; anything else would leave the dialog unanswered or misread.
+    options = pending.get("options")
+    if method == "select" and args.value is not None and isinstance(options, list) and args.value not in options:
+        die("select value must be one of the offered options: " + ", ".join(repr(option) for option in options))
     if args.value is not None:
         fields = {"value": args.value}
     elif args.confirmed:
@@ -1428,9 +1457,17 @@ def build_parser() -> argparse.ArgumentParser:
             item.add_argument("--json", action="store_true", help="print the full result artifact")
         item.set_defaults(func=globals()[name])
 
-    wait_p = sub.add_parser("wait")
+    wait_p = sub.add_parser(
+        "wait",
+        help="block until the open run settles (exit 0), times out (1), or fails (2)",
+    )
     wait_p.add_argument("slug")
     wait_p.add_argument("timeout", nargs="?", type=float, default=600)
+    wait_p.add_argument(
+        "--return-on-ui",
+        action="store_true",
+        help="exit 3 and print the dialog when the worker is blocked on an extension dialog",
+    )
     add_cwd(wait_p)
     wait_p.set_defaults(func=wait_worker)
 
