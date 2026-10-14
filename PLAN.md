@@ -110,3 +110,44 @@ this checkout with supported skill-directory symlinks.
 6. Remove the legacy `~/.codex/skills/pi-rpc-worker` copy only after the Codex
    installation resolves to this checkout and current project guidance has
    been updated to `$pi-delegate`.
+
+## Progress — 2026-10-14
+
+- Reviewed and merged `claude-code-support` with a merge commit. Preserved
+  complete blocking-dialog text and select options, fixing a mismatch caused
+  by truncating options before exact-answer validation. Added an end-to-end
+  regression test; all 25 deterministic tests passed outside the sandbox.
+- Reinstalled the global Codex skill as a symlink to this checkout and removed
+  the obsolete clone after checking that its commits were preserved here.
+- Made Herdr monitoring the default when `HERDR_ENV=1`: one background pane
+  per worker, unchanged caller focus, result capture before pane cleanup,
+  and no pane-close commands outside Herdr. User requests can disable panes
+  or keep them open. Dialogs and wait timeouts do not trigger cleanup.
+- Verified the complete pane lifecycle with real Pi: split, watch streamed
+  output, read the completed result, close the created pane, and stop the
+  worker. Confirmed the original pane retained focus.
+- Verified a textual clarification followed by `follow-up`: two runs in the
+  same Pi session, with the missing duration supplied between runs and the
+  correct calculation afterward.
+- Verified real extension UI in a temporary project: `confirm` and `select`
+  each caused `wait --return-on-ui` to exit 3; `ui-respond --confirmed` and
+  `ui-respond --value` resumed the same run. The calculation completed with
+  no RPC errors or remaining pending dialog. Closed the monitoring pane and
+  stopped the worker. The extension and runtime logs were not added here.
+- Diagnosed missing Herdr context under Codex CLI 0.162.1: shell tools ran in
+  a shared app-server without `HERDR_*`. Resuming without the daemon restored
+  the pane context and enabled the real monitoring checks.
+- Checked documentation links and Git whitespace. Skill frontmatter is
+  unchanged; `quick_validate.py` could not run because PyYAML is unavailable.
+
+### Remaining work
+
+- Plugin packaging is still to be designed; this repository currently
+  installs a skill through its own installer.
+- Herdr panes display the RPC event watcher, not an interactive Pi TUI.
+  An interactive backend would need its own control and result contract.
+- The watcher still abbreviates tool arguments and output, hides thinking by
+  default, and displays blocking-dialog identifiers rather than their full
+  text. Full valid RPC events remain available in the JSONL log / raw view.
+- Claude Code timeout guidance needs version- and mode-specific clarification;
+  the review identified that a universal two-hour limit is inaccurate.

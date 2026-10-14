@@ -54,12 +54,16 @@ Add `--thinking` only when the user wants Pi's streamed thinking, `--raw` for
 the original JSONL, `--history 0` to start at the current end, or `--stay` to
 watch later runs too.
 
-When the user requested Herdr monitoring and `HERDR_ENV=1`, apply the installed
-`$herdr` skill: create a background sibling pane without stealing focus and
-run this same `watch` command there. The user can then observe the Pi worker in
-Herdr while the orchestrating agent continues in its pane. If `HERDR_ENV` is
-absent, Herdr control is forbidden; run `watch` through the host's normal
-persistent execution facility instead. See
+When `HERDR_ENV=1`, show each worker in a separate background sibling pane
+by default, using the installed `$herdr` skill and this same `watch` command.
+Keep the caller's focus and use the target project directory. Record the
+created pane ID. If this run was monitored in a Herdr pane you created,
+read its result after it settles and close that pane. Keep it open only if
+the user asked. A blocking dialog or timeout is not
+completion. A later follow-up gets a new monitoring pane if the old one was
+closed. Honor an explicit request to run without a pane. If `HERDR_ENV` is
+absent, Herdr control is forbidden; use the host's normal persistent execution
+facility instead. See
 [live-monitoring.md](references/live-monitoring.md).
 
 Substitute the resolved skill and project paths. Prefer

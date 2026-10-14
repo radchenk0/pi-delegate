@@ -110,7 +110,8 @@ agent-facing usage. `CLAUDE.md` contains repository guidance for Claude Code;
 skill discovery still uses `SKILL.md`.
 
 `watch` renders the live Pi event stream in a terminal. When an orchestrator
-runs inside Herdr and the user requested Herdr monitoring, it can place the
-same watcher in a background sibling pane; outside Herdr it runs through the
-host's normal persistent process facility. See
+runs inside Herdr (`HERDR_ENV=1`), it opens a separate background monitoring
+pane for each worker by default and closes it after reading the completed
+run's result. The user can request no pane or ask to keep it open. Outside
+Herdr, workers use the host's normal persistent process facility. See
 [live monitoring](references/live-monitoring.md).
