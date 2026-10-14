@@ -53,7 +53,10 @@ for raw in sys.stdin.buffer:
                 },
             })
             emit({"type": "agent_settled"})
-        if command.get("id") == "ui-2" and command.get("value") == "y: allow once":
+        if (command.get("id"), command.get("value")) in {
+            ("ui-2", "y: allow once"),
+            ("ui-3", "allow " + "д" * 5000 + " END"),
+        }:
             emit({"type": "turn_start"})
             emit({
                 "type": "message_end",
@@ -93,6 +96,17 @@ for raw in sys.stdin.buffer:
             time.sleep(30)
             continue
         if "HOLD" in message:
+            continue
+        if "LONG_SELECT" in message:
+            emit({
+                "type": "extension_ui_request",
+                "id": "ui-3",
+                "method": "select",
+                "title": "title " + "т" * 5000 + " END",
+                "message": "message " + "м" * 5000 + " END",
+                "placeholder": "placeholder " + "п" * 5000 + " END",
+                "options": ["allow " + "д" * 5000 + " END", "deny"],
+            })
             continue
         if "SELECT" in message:
             # A permission-style select dialog: the answer must be one of

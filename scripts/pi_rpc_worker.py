@@ -32,10 +32,8 @@ RESULT_SCHEMA = "pi-delegate.result.v1"
 # until an extension_ui_response arrives; the rest are fire-and-forget.
 UI_DIALOG_METHODS = {"select", "confirm", "input", "editor"}
 UI_FIRE_AND_FORGET_METHODS = {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"}
-# Dialog fields an orchestrator needs to answer without reading events.jsonl;
-# long titles (e.g. a whole shell command) are capped to keep state.json small.
+# Dialog fields an orchestrator needs to answer without reading events.jsonl.
 UI_DIALOG_FIELDS = ("title", "message", "options", "placeholder", "timeout")
-UI_TEXT_LIMIT = 4000
 
 
 def die(message: str, code: int = 2) -> NoReturn:
@@ -72,9 +70,9 @@ def pending_ui_record(event: dict, request_id: str, method: str) -> dict:
     for field in UI_DIALOG_FIELDS:
         value = event.get(field)
         if isinstance(value, str):
-            record[field] = value[:UI_TEXT_LIMIT]
+            record[field] = value
         elif field == "options" and isinstance(value, list):
-            record[field] = [str(option)[:UI_TEXT_LIMIT] for option in value]
+            record[field] = [str(option) for option in value]
         elif field == "timeout" and isinstance(value, (int, float)) and not isinstance(value, bool):
             record[field] = value
     return record

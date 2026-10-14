@@ -306,6 +306,33 @@ class WorkerControlTest(WorkerTestCase):
         self.assertEqual(self.run_result(settled)["finalMessage"], "done: ui selected")
         self.stop("sel")
 
+    def test_long_dialog_text_and_select_answer_are_preserved(self):
+        self.start("longui", "LONG_SELECT")
+        state = self.wait_state(
+            "longui",
+            lambda s: isinstance(s.get("pendingUi"), dict) and s["pendingUi"].get("id") == "ui-3",
+            timeout=10,
+        )
+        pending = state["pendingUi"]
+        for field, character in (("title", "т"), ("message", "м"), ("placeholder", "п")):
+            self.assertEqual(pending[field], field + " " + character * 5000 + " END")
+        option = "allow " + "д" * 5000 + " END"
+        self.assertEqual(pending["options"], [option, "deny"])
+
+        blocked = self.command("wait", "longui", "5", "--return-on-ui", check=False)
+        self.assertEqual(blocked.returncode, 3)
+        self.assertIn("title: " + pending["title"], blocked.stdout)
+        self.assertIn("message: " + pending["message"], blocked.stdout)
+        self.assertIn("option: " + option, blocked.stdout)
+
+        self.command("ui-respond", "longui", "--value", option)
+        settled = self.wait_state(
+            "longui", lambda s: s.get("status") == "idle" and s.get("pendingUi") is None, timeout=10,
+        )
+        # The fake Pi settles only after receiving the complete option verbatim.
+        self.assertEqual(self.run_result(settled)["finalMessage"], "done: ui selected")
+        self.stop("longui")
+
     def test_wait_return_on_ui_surfaces_a_blocking_dialog(self):
         self.start("wui", "SELECT")
         self.wait_state("wui", lambda s: isinstance(s.get("pendingUi"), dict), timeout=10)
