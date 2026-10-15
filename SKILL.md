@@ -50,12 +50,16 @@ tool calls/results, compaction, blocking UI, and lifecycle events:
 python3 /absolute/path/to/pi-delegate/scripts/pi_rpc_worker.py watch task-name --cwd /absolute/path/to/project
 ```
 
+`watch` shows blocking-dialog text and options, and streams partial tool
+results before completion. Use `--full` for complete tool arguments/output;
+the default display limits can be set with `--tool-args` and `--tool-output`.
 Add `--thinking` only when the user wants Pi's streamed thinking, `--raw` for
 the original JSONL, `--history 0` to start at the current end, or `--stay` to
-watch later runs too.
+watch later runs too. Use `--stay` when attaching before an idle follow-up.
 
 When `HERDR_ENV=1`, show each worker in a separate background sibling pane
 by default, using the installed `$herdr` skill and this same `watch` command.
+If that skill is unavailable, read the release-matched `herdr --skill` first.
 Keep the caller's focus and use the target project directory. Record the
 created pane ID. If this run was monitored in a Herdr pane you created,
 read its result after it settles and close that pane. Keep it open only if
@@ -156,5 +160,7 @@ out of version control unless the project explicitly tracks agent state.
 Read [result-schema.md](references/result-schema.md) for state and result
 fields, [rpc-protocol.md](references/rpc-protocol.md) for protocol details, and
 [claude-code.md](references/claude-code.md) for running workers from Claude Code.
+For Codex execution handles, plugin paths, and shared-server environment
+behavior, read [codex.md](references/codex.md).
 To use Pi as the implementer in superpowers' subagent-driven development,
 read [superpowers-sdd.md](references/superpowers-sdd.md).

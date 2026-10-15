@@ -19,6 +19,7 @@ def emit(value, split=False):
 
 
 emit({"type": "session", "sessionId": "fake-session"})
+tool_pending = False
 for raw in sys.stdin.buffer:
     command = json.loads(raw)
     request_id = command.get("id")
@@ -97,6 +98,18 @@ for raw in sys.stdin.buffer:
             continue
         if "HOLD" in message:
             continue
+        if "WATCH_TOOLS" in message:
+            tool_pending = True
+            emit({"type": "tool_execution_start", "toolCallId": "call-one", "toolName": "bash", "args": {"command": "x" * 1000 + " ARG_END\u001b[31m"}})
+            for output in ("FIRST\n", "FIRST\n" + "x" * 1300 + " UPDATE_END", "FIRST\n" + "x" * 1300 + " UPDATE_END"):
+                emit({"type": "tool_execution_update", "toolCallId": "call-one", "toolName": "bash", "partialResult": {"content": [{"type": "text", "text": output}]}})
+            emit({"type": "tool_execution_start", "toolCallId": "call-two", "toolName": "bash", "args": {"command": "parallel"}})
+            emit({"type": "tool_execution_update", "toolCallId": "call-two", "toolName": "bash", "partialResult": {"content": [{"type": "text", "text": "PARALLEL"}]}})
+            emit({"type": "tool_execution_end", "toolCallId": "call-two", "toolName": "bash", "isError": True, "result": {"content": [{"type": "text", "text": "REPLACED_ERROR"}]}})
+            continue
+        if tool_pending:
+            emit({"type": "tool_execution_end", "toolCallId": "call-one", "toolName": "bash", "result": {"content": [{"type": "text", "text": "FIRST\n" + "x" * 1300 + " UPDATE_END FINAL_END"}]}})
+            tool_pending = False
         if "LONG_SELECT" in message:
             emit({
                 "type": "extension_ui_request",

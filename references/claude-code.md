@@ -13,28 +13,43 @@ default target is Codex, so Claude files are not created accidentally.
 
 ## Running workers from Claude Code
 
-The commands below assume the Claude target is installed, so the helper lives at
-`~/.claude/skills/pi-delegate/scripts/pi_rpc_worker.py`.
+The examples below use the standalone Claude installation at
+`~/.claude/skills/pi-delegate/scripts/pi_rpc_worker.py`. In a plugin installation,
+resolve the loaded skill directory (`skills/pi-delegate` inside the plugin)
+and use its helper by absolute path instead.
 
 **`serve` runs as a background Bash command.** This is the host's
-persistent-session facility the skill asks for. Call the Bash tool with
-`run_in_background: true` and the largest `timeout` (`7200000`, two hours).
-The harness notifies the session when the command exits. Do not detach it with
-`&` or `nohup` instead. A background command is stopped at its timeout, so a
-worker that must outlive two hours needs `stop` and a later `serve` with the
-same slug, which resumes the session. If the supervisor was killed without
-cleanup, `status` reports `orphaned`: run `recover` before serving again.
+persistent-session facility the skill asks for. Use `run_in_background: true`
+in the orchestrating conversation, not a short-lived foreground subagent.
+Keep the returned task handle. Do not detach with `&` or `nohup`.
 
-**`wait` runs in the foreground in bounded calls.** A foreground Bash call is
-capped at ten minutes, so keep each wait under it and loop:
+Background lifetime depends on the installed Claude Code version and session
+mode. In v2.1.288 and later, interactive local sessions have no background
+time limit. Unattended sessions have a separate time budget: normally 30
+minutes, with a two-hour ceiling unless configuration raises it. Plain-text
+`-p` runs default to ten minutes. The limits introduced in v2.1.285 applied
+to interactive sessions too before v2.1.288. A foreground subagent's commands
+stop when that subagent ends, regardless of these budgets.
+
+For unattended runs, request a supported `timeout` long enough for the task.
+If the host stops the supervisor, inspect `status`; use `recover` for an
+orphaned worker, then `serve` the same slug to resume its durable session.
+Do not assume every installation accepts an arbitrary two-hour timeout.
+See the official [Bash background lifetime reference](https://code.claude.com/docs/en/tools-reference#time-limit-for-background-commands).
+
+**`wait` runs in the foreground in bounded calls.** The usual foreground
+ceiling is ten minutes, configurable through `BASH_DEFAULT_TIMEOUT_MS` and
+`BASH_MAX_TIMEOUT_MS`. Use short waits to keep the orchestrator responsive:
 
 ```bash
-python3 ~/.claude/skills/pi-delegate/scripts/pi_rpc_worker.py wait task-name 590 --return-on-ui --cwd /absolute/path/to/project
+python3 ~/.claude/skills/pi-delegate/scripts/pi_rpc_worker.py wait task-name 30 --return-on-ui --cwd /absolute/path/to/project
 ```
 
 Exit 1 means call again. Exit 3 means a dialog is blocking the worker: read
 the printed title and options, answer with `ui-respond`, and wait again.
-Without `--return-on-ui`, a dialog consumes the whole ten-minute window.
+Without `--return-on-ui`, a dialog consumes the wait window. If Claude moves
+the wait command into the background, collect that task's result before
+starting another wait; a Bash-tool return alone is not worker completion.
 
 **Pass briefs as files.** Write the brief with the Write tool and pass
 `--prompt-file`. Positional prompts are visible in the process list, and long

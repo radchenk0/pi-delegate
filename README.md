@@ -1,7 +1,7 @@
 # pi-delegate
 
-An installable agent skill for delegating bounded work to long-lived `pi`
-coding-agent sessions over its JSONL RPC protocol.
+An agent skill and buildable plugin for delegating bounded work to long-lived
+`pi` coding-agent sessions over its JSONL RPC protocol.
 
 This repository is the source of truth. The installer creates a personal skill
 directory symlink, so edits in this checkout are immediately available.
@@ -95,6 +95,46 @@ Existing unrelated paths are refused. `--replace` moves one to a timestamped
 sibling backup before linking. `--uninstall` removes only a symlink resolving
 to this checkout.
 
+## Build and install the plugin
+
+Keep the source skill in this checkout, or build a distributable plugin:
+
+```bash
+python3 scripts/package_plugin.py
+```
+
+The output under `dist/pi-delegate-0.2.0/` contains a self-contained plugin
+directory, a ZIP with plugin files at its root, and local marketplaces for
+Codex and Claude Code. The skill, references, and helper are copied into
+`pi-delegate/skills/pi-delegate/`; no source-checkout link is required. Runtime
+logs, credentials, tests, and local agent configuration are excluded. Existing
+output is refused; use `--output /another/new/directory` for another build.
+
+Install using the host's plugin mechanism:
+
+```bash
+codex plugin marketplace add ./dist/pi-delegate-0.2.0
+codex plugin add pi-delegate@pi-delegate-local
+
+claude plugin marketplace add ./dist/pi-delegate-0.2.0
+claude plugin install pi-delegate@pi-delegate-local
+```
+
+For a temporary Claude session, this loads the plugin without installing it:
+
+```bash
+claude --plugin-dir ./dist/pi-delegate-0.2.0/pi-delegate
+```
+
+Choose either the standalone skill or the plugin to avoid duplicate discovery.
+In Codex, the plugin skill is `$pi-delegate:pi-delegate`; the standalone skill
+remains `$pi-delegate`.
+Plugin copies are release snapshots; rebuild and update through your host
+after source changes. Pi and provider configuration remain user-managed.
+
+The package uses the portable [Agent Plugins layout](https://developers.openai.com/plugins/build/plugins)
+and includes Codex and [Claude compatibility manifests](https://code.claude.com/docs/en/plugins-reference).
+
 ## Develop and validate
 
 The helper uses only the Python standard library and requires `pi` on `PATH`.
@@ -102,6 +142,7 @@ The helper uses only the Python standard library and requires `pi` on `PATH`.
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/pi_rpc_worker.py --help
+python3 scripts/package_plugin.py --help
 ```
 
 Runtime artifacts belong to the delegated project under `.pi/`. See
@@ -109,7 +150,9 @@ Runtime artifacts belong to the delegated project under `.pi/`. See
 agent-facing usage. `CLAUDE.md` contains repository guidance for Claude Code;
 skill discovery still uses `SKILL.md`.
 
-`watch` renders the live Pi event stream in a terminal. When an orchestrator
+`watch` renders assistant text, full dialog questions/options, and intermediate
+tool output. Use `--full` to remove tool text display limits or
+`--no-tool-updates` for final results only. Thinking remains opt-in. When an orchestrator
 runs inside Herdr (`HERDR_ENV=1`), it opens a separate background monitoring
 pane for each worker by default and closes it after reading the completed
 run's result. The user can request no pane or ask to keep it open. Outside

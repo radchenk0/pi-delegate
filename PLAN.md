@@ -140,14 +140,39 @@ this checkout with supported skill-directory symlinks.
 - Checked documentation links and Git whitespace. Skill frontmatter is
   unchanged; `quick_validate.py` could not run because PyYAML is unavailable.
 
-### Remaining work
+### RPC plugin completion
 
-- Plugin packaging is still to be designed; this repository currently
-  installs a skill through its own installer.
-- Herdr panes display the RPC event watcher, not an interactive Pi TUI.
-  An interactive backend would need its own control and result contract.
-- The watcher still abbreviates tool arguments and output, hides thinking by
-  default, and displays blocking-dialog identifiers rather than their full
-  text. Full valid RPC events remain available in the JSONL log / raw view.
-- Claude Code timeout guidance needs version- and mode-specific clarification;
-  the review identified that a universal two-hour limit is inaccurate.
+- Added a standard-library plugin builder, portable manifest, Codex/Claude
+  compatibility manifests, local marketplaces, and a self-contained ZIP.
+  The root skill remains the single source; the standalone installation is
+  preserved. Runtime and personal configuration are excluded from builds.
+- Installed the generated 0.2.0 plugin using Codex CLI in an isolated
+  temporary home. Claude's strict plugin and marketplace validation passed
+  without warnings. The user's active plugin configuration was not changed.
+  Codex's native `skills/list` also discovered the cached skill under its
+  qualified name `pi-delegate:pi-delegate`; packaged UI metadata uses it.
+- Expanded `watch` with full dialog fields/options, notifications and extension
+  errors, intermediate tool results, configurable argument/output limits,
+  `--full`, and `--no-tool-updates`. Cumulative result snapshots do not repeat
+  already displayed text; calls are tracked independently. A pending dialog
+  is shown even when its event predates the replay window.
+- All 27 deterministic tests passed. New coverage checks early tool output,
+  parallel calls, replacement results, full/limited/hidden output, long UI
+  text, packaged helper execution from an extracted ZIP, and rejection of
+  existing build output. Existing standalone installer tests still pass.
+- Repeated the live confirm/select smoke with the updated watcher: the Herdr
+  pane displayed the actual questions and options, both responses resumed the
+  same run, and the final answer was correct. Stopped the worker and closed
+  the created pane.
+- Updated Claude background-lifetime guidance for interactive versus
+  unattended/version-specific behavior. Added Codex execution guidance and
+  repository-level `AGENTS.md`.
+
+### Deliberately deferred
+
+- Keep RPC as the worker backend. Herdr displays its read-only watcher;
+  interactive Pi TUI integration is outside the current scope.
+- Thinking remains opt-in. Non-text tool content is available in raw RPC
+  records rather than rendered as terminal images.
+- Release 2 candidates above remain an optional roadmap, not requirements
+  of the RPC plugin completion work.

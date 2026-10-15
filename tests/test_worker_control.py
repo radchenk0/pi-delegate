@@ -18,6 +18,40 @@ from base import WorkerTestCase
 
 
 class WorkerControlTest(WorkerTestCase):
+    def test_watch_streams_tools_and_full_mode_preserves_text(self):
+        self.start("tools", "WATCH_TOOLS")
+        self.wait_state("tools", lambda s: s.get("lastEvent") == "tool_execution_end")
+        # Inspect while the run is still open, before a final assistant answer.
+        partial = self.command("watch", "tools", "--no-follow", "--full", "--color", "never")
+        self.assertIn("ARG_END\\u001b[31m", partial.stdout)
+        self.assertNotIn("\x1b", partial.stdout)
+        self.assertIn("UPDATE_END", partial.stdout)
+        self.assertNotIn("FINAL_END", partial.stdout)
+        self.assertEqual(partial.stdout.count("FIRST"), 1)
+        self.assertEqual(partial.stdout.count("UPDATE_END"), 1)
+        self.assertIn("PARALLEL", partial.stdout)
+        self.assertIn("REPLACED_ERROR", partial.stdout)
+        self.assertIn("bash error", partial.stdout)
+
+        limited = self.command("watch", "tools", "--no-follow", "--tool-args", "30", "--tool-output", "40")
+        self.assertNotIn("ARG_END", limited.stdout)
+        self.assertNotIn("UPDATE_END", limited.stdout)
+        self.assertIn("tool output truncated", limited.stdout)
+        hidden = self.command("watch", "tools", "--no-follow", "--tool-output", "0")
+        self.assertNotIn("FIRST", hidden.stdout)
+        self.assertNotIn("PARALLEL", hidden.stdout)
+
+        self.command("follow-up", "tools", "finish")
+        self.wait_state("tools", lambda s: s.get("status") == "idle", timeout=10)
+        final = self.command("watch", "tools", "--no-follow", "--full")
+        self.assertEqual(final.stdout.count("FIRST"), 1)
+        self.assertEqual(final.stdout.count("UPDATE_END"), 1)
+        self.assertIn("FINAL_END", final.stdout)
+        only_final = self.command("watch", "tools", "--no-follow", "--no-tool-updates", "--full")
+        self.assertNotIn("partial output", only_final.stdout)
+        self.assertIn("FINAL_END", only_final.stdout)
+        self.stop("tools")
+
     def test_watch_replays_human_readable_events(self):
         self.start("observe", "STREAM")
         self.wait_state("observe", lambda s: s.get("status") == "idle")
@@ -318,6 +352,13 @@ class WorkerControlTest(WorkerTestCase):
             self.assertEqual(pending[field], field + " " + character * 5000 + " END")
         option = "allow " + "д" * 5000 + " END"
         self.assertEqual(pending["options"], [option, "deny"])
+
+        watched = self.command("watch", "longui", "--no-follow", "--color", "never")
+        for field in ("title", "message", "placeholder"):
+            self.assertIn(f"{field}: {pending[field]}", watched.stdout)
+        self.assertIn("option: " + option, watched.stdout)
+        current_only = self.command("watch", "longui", "--history", "0", "--no-follow")
+        self.assertIn("option: " + option, current_only.stdout)
 
         blocked = self.command("wait", "longui", "5", "--return-on-ui", check=False)
         self.assertEqual(blocked.returncode, 3)

@@ -1257,10 +1257,16 @@ def result_text(value: object) -> str:
 
 
 class WatchRenderer:
-    def __init__(self, *, thinking: bool, tool_output: int, color: bool) -> None:
+    def __init__(self, *, thinking: bool, tool_output: int | None, color: bool, tool_args: int = 800, tool_updates: bool = True) -> None:
         self.thinking = thinking
         self.tool_output = tool_output
         self.color = color
+        self.tool_args = tool_args
+        self.tool_updates = tool_updates
+        self.tool_snapshots: dict[str, str] = {}
+        self.tool_printed: dict[str, int] = {}
+        self.tool_truncated: set[str] = set()
+        self.ui_requests_seen: set[str] = set()
         self.stream: str | None = None
         self.turn_had_text = False
 
@@ -1274,7 +1280,27 @@ class WatchRenderer:
 
     def label(self, value: str, code: str = "36") -> None:
         self.end_stream()
-        print(self.paint(code, value), flush=True)
+        print(self.paint(code, safe_terminal(value)), flush=True)
+
+    def tool_text(self, key: str, output: str) -> None:
+        previous = self.tool_snapshots.get(key, "")
+        self.tool_snapshots[key] = output
+        if self.tool_output == 0 or not output:
+            return
+        # Built-in tools report cumulative snapshots. Other extensions may
+        # replace their result; show a replacement rather than dropping it.
+        delta = output[len(previous):] if output.startswith(previous) else output
+        if not delta:
+            return
+        used = self.tool_printed.get(key, 0)
+        remaining = None if self.tool_output is None else max(0, self.tool_output - used)
+        visible = delta if remaining is None else delta[:remaining]
+        if visible:
+            print(safe_terminal(visible), flush=True)
+            self.tool_printed[key] = used + len(visible)
+        if remaining is not None and len(delta) > remaining and key not in self.tool_truncated:
+            print("… [tool output truncated; use --full for complete text]", flush=True)
+            self.tool_truncated.add(key)
 
     def delta(self, kind: str, value: str) -> None:
         if not value:
@@ -1314,8 +1340,19 @@ class WatchRenderer:
                     self.end_stream()
         elif event_type == "tool_execution_start":
             name = str(event.get("toolName") or "tool")
-            args = compact_json(event.get("args") or {}, 800)
+            key = str(event.get("toolCallId") or name)
+            self.tool_snapshots.pop(key, None)
+            self.tool_printed.pop(key, None)
+            self.tool_truncated.discard(key)
+            args = compact_json(event.get("args") or {}, self.tool_args)
             self.label(f"→ {name} {args}", "33")
+        elif event_type == "tool_execution_update" and self.tool_updates:
+            name = str(event.get("toolName") or "tool")
+            key = str(event.get("toolCallId") or name)
+            output = result_text(event.get("partialResult"))
+            if output and self.tool_output != 0 and output != self.tool_snapshots.get(key):
+                self.label(f"↳ {name} partial output", "33")
+                self.tool_text(key, output)
         elif event_type == "tool_execution_end":
             name = str(event.get("toolName") or "tool")
             result = event.get("result")
@@ -1324,14 +1361,28 @@ class WatchRenderer:
             )
             self.label(f"← {name} {'error' if failed else 'ok'}", "31" if failed else "33")
             output = result_text(result)
-            if output and self.tool_output:
-                if len(output) > self.tool_output:
-                    output = output[: self.tool_output - 1] + "…"
-                print(safe_terminal(output), flush=True)
+            key = str(event.get("toolCallId") or name)
+            self.tool_text(key, output)
+            self.tool_snapshots.pop(key, None)
+            self.tool_printed.pop(key, None)
+            self.tool_truncated.discard(key)
         elif event_type == "extension_ui_request":
             method = event.get("method")
             if method in UI_DIALOG_METHODS:
+                request_id = str(event.get("id"))
+                if request_id in self.ui_requests_seen:
+                    return
+                self.ui_requests_seen.add(request_id)
                 self.label(f"⚠ UI blocked: {method} ({event.get('id')})", "1;31")
+                for field in ("title", "message", "placeholder", "timeout"):
+                    if event.get(field) is not None:
+                        print(safe_terminal(f"{field}: {event[field]}"), flush=True)
+                for option in event.get("options") or []:
+                    print(safe_terminal(f"option: {option}"), flush=True)
+            elif method == "notify":
+                self.label(f"notification: {event.get('message') or ''}")
+        elif event_type == "extension_error":
+            self.label(f"✗ extension error: {event.get('error') or event.get('message') or 'unknown error'}", "1;31")
         elif event_type == "compaction_start":
             self.label("◇ compaction started", "35")
         elif event_type == "compaction_end":
@@ -1342,8 +1393,8 @@ class WatchRenderer:
 
 def watch(args: argparse.Namespace) -> int:
     p = worker_paths(args)
-    if args.history < 0 or args.tool_output < 0 or args.poll <= 0:
-        die("--history and --tool-output must be non-negative; --poll must be positive")
+    if args.history < 0 or args.tool_output < 0 or args.tool_args < 0 or args.poll <= 0:
+        die("--history, --tool-output and --tool-args must be non-negative; --poll must be positive")
     state = load_state(p["state"])
     if not state:
         die(f"no worker state for '{args.slug}' in {p['cwd']}")
@@ -1353,7 +1404,13 @@ def watch(args: argparse.Namespace) -> int:
         die(f"worker has no event stream: {p['events']}")
 
     color = args.color == "always" or (args.color == "auto" and sys.stdout.isatty())
-    renderer = WatchRenderer(thinking=args.thinking, tool_output=args.tool_output, color=color)
+    renderer = WatchRenderer(
+        thinking=args.thinking,
+        tool_output=None if args.full else args.tool_output,
+        tool_args=0 if args.full else args.tool_args,
+        tool_updates=not args.no_tool_updates,
+        color=color,
+    )
     print(
         f"watching {args.slug} status={state.get('status')} "
         f"model={state.get('actualProvider') or '?'}:{state.get('actualModel') or '?'}",
@@ -1373,6 +1430,12 @@ def watch(args: argparse.Namespace) -> int:
                     renderer.render(event)
         else:
             handle.seek(0, os.SEEK_END)
+
+        # A dialog can predate the replay window (or --history 0). Show the
+        # currently pending question even if its event wasn't replayed.
+        pending = load_state(p["state"]).get("pendingUi")
+        if not args.raw and isinstance(pending, dict) and str(pending.get("id")) not in renderer.ui_requests_seen:
+            renderer.render({"type": "extension_ui_request", **pending})
 
         if args.no_follow:
             renderer.end_stream()
@@ -1440,7 +1503,10 @@ def build_parser() -> argparse.ArgumentParser:
     watch_p.add_argument("slug")
     watch_p.add_argument("--history", type=int, default=200, help="replay this many recent events first; 0 starts at EOF")
     watch_p.add_argument("--thinking", action="store_true", help="include streamed model thinking")
-    watch_p.add_argument("--tool-output", type=int, default=1200, help="maximum tool-result characters to print; 0 hides output")
+    watch_p.add_argument("--tool-output", type=int, default=1200, help="maximum text characters per tool call across updates and result; 0 hides output")
+    watch_p.add_argument("--tool-args", type=int, default=800, help="maximum characters of tool arguments; 0 means unlimited")
+    watch_p.add_argument("--full", action="store_true", help="show complete tool arguments and output, overriding display limits; thinking remains opt-in")
+    watch_p.add_argument("--no-tool-updates", action="store_true", help="show only final tool results, hiding intermediate output")
     watch_p.add_argument("--raw", action="store_true", help="print raw JSON events")
     watch_p.add_argument("--no-follow", action="store_true", help="replay history and exit")
     watch_p.add_argument("--stay", action="store_true", help="keep watching across settled runs")
